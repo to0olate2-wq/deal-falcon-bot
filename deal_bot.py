@@ -194,30 +194,39 @@ def check_amazon():
 # ---------------------------------------------------------------- noon
 
 def fetch_page(url):
-    """Try fetching directly (free). If Noon blocks the request and a
-    ScraperAPI key exists, retry through ScraperAPI."""
+    """Try fetching directly (free). If Noon blocks the request, fall back to
+    ScraperAPI - first the cheap simple fetch, then the heavy browser-rendered
+    fetch as a last resort."""
     try:
         r = requests.get(url, headers=HEADERS, timeout=60)
         if r.status_code == 200 and "captcha" not in r.text[:3000].lower():
             return r.text
     except Exception:
         pass
-    if SCRAPER_KEY:
-        try:
-            r = requests.get(
-                "https://api.scraperapi.com/",
-                params={"api_key": SCRAPER_KEY, "url": url,
-                        "country_code": "ae", "render": "true"},
-                timeout=180,
-            )
-            if r.status_code == 200:
-                return r.text
-            ERRORS.append(f"Noon via ScraperAPI: HTTP {r.status_code}")
-        except Exception as e:
-            ERRORS.append(f"Noon via ScraperAPI: {type(e).__name__}")
-    else:
+    if not SCRAPER_KEY:
         ERRORS.append("Noon blocked the direct request and no SCRAPERAPI_KEY "
                       "is set to retry through.")
+        return None
+    last_error = "unknown"
+    attempts = [
+        # cheap and usually enough - Noon's product data is in the raw page
+        {"api_key": SCRAPER_KEY, "url": url, "country_code": "ae"},
+        # heavy fallback - loads the page in a real browser
+        {"api_key": SCRAPER_KEY, "url": url, "country_code": "ae",
+         "render": "true"},
+    ]
+    for params in attempts:
+        try:
+            r = requests.get("https://api.scraperapi.com/",
+                             params=params, timeout=180)
+            if r.status_code == 200:
+                return r.text
+            last_error = f"HTTP {r.status_code}"
+        except Exception as e:
+            last_error = type(e).__name__
+        time.sleep(3)
+    ERRORS.append(f"Noon fetch failed this run ({last_error}) - "
+                  "it will retry automatically on the next scheduled run.")
     return None
 
 
