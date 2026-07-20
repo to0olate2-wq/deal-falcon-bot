@@ -1,0 +1,14 @@
+{
+  "min_discount_percent": 40,
+  "max_alerts_per_run": 10,
+  "amazon_searches": [
+    "laptop",
+    "smartphone",
+    "headphones",
+    "smart watch",
+    "air fryer"
+  ],
+  "noon_pages": [
+    "https://www.noon.com/uae-en/electronics-and-mobiles/"
+  ]
+}
