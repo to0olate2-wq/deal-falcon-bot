@@ -38,9 +38,16 @@ REMEMBER_DAYS = 7  # don't re-alert the same deal within this many days
 STATE_FILE = ROOT / "state" / "seen.json"
 STATE_FILE.parent.mkdir(exist_ok=True)
 try:
-    SEEN = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    _state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
 except Exception:
-    SEEN = {}
+    _state = {}
+# newer format: {"cursor": 0, "seen": {...}} - older format was a flat dict
+if isinstance(_state, dict) and "seen" in _state:
+    SEEN = _state.get("seen", {})
+    CURSOR = int(_state.get("cursor", 0))
+else:
+    SEEN = _state if isinstance(_state, dict) else {}
+    CURSOR = 0
 
 HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -161,14 +168,30 @@ def harvest(obj, store, base_url, out):
 
 # ---------------------------------------------------------------- amazon.ae
 
-def check_amazon():
+def pick_searches():
+    """Rotate through the keyword list so every run covers a DIFFERENT slice
+    of the catalogue. Over a day or two the whole list gets swept, without
+    burning credits on hundreds of searches in one go."""
+    all_terms = [t for t in CONFIG.get("amazon_searches", []) if t.strip()]
+    if not all_terms:
+        return [], 0
+    per_run = int(CONFIG.get("searches_per_run", 8))
+    if per_run <= 0 or per_run >= len(all_terms):
+        return all_terms, 0
+    start = CURSOR % len(all_terms)
+    # wrap around the end of the list
+    doubled = all_terms + all_terms
+    return doubled[start:start + per_run], (start + per_run) % len(all_terms)
+
+
+def check_amazon(queries):
     """Uses ScraperAPI's structured Amazon endpoint - returns clean product
     data with current price and original price, no fragile page-parsing."""
     found = []
     if not SCRAPER_KEY:
         ERRORS.append("Amazon skipped: no SCRAPERAPI_KEY secret set.")
         return found
-    for query in CONFIG.get("amazon_searches", []):
+    for query in queries:
         try:
             r = requests.get(
                 "https://api.scraperapi.com/structured/amazon/search",
@@ -265,7 +288,11 @@ def check_noon():
 # ---------------------------------------------------------------- main
 
 def main():
-    deals = check_amazon() + check_noon()
+    queries, next_cursor = pick_searches()
+    total_terms = len([t for t in CONFIG.get("amazon_searches", []) if t.strip()])
+    log(f"This run covers {len(queries)} of {total_terms} keywords: "
+        + ", ".join(queries))
+    deals = check_amazon(queries) + check_noon()
     log(f"Raw products with a discount found: {len(deals)}")
 
     # keep only deals that meet YOUR threshold
@@ -315,13 +342,16 @@ def main():
     # prune old memory
     for k in [k for k, ts in SEEN.items() if now_ts - ts > REMEMBER_DAYS * 86400]:
         del SEEN[k]
-    STATE_FILE.write_text(json.dumps(SEEN, indent=0), encoding="utf-8")
+    STATE_FILE.write_text(
+        json.dumps({"cursor": next_cursor, "seen": SEEN}, indent=0),
+        encoding="utf-8")
 
     # on a manual test run, always confirm the bot is alive
     if IS_MANUAL_RUN:
         status = (f"\u2705 Deal Falcon is alive.\n"
-                  f"Scanned Amazon.ae + Noon \u00b7 found {len(deals)} "
-                  f"discounted products \u00b7 {len(fresh)} passed your "
+                  f"Swept {len(queries)} of {total_terms} categories "
+                  f"(rotating) + Noon \u00b7 found {len(deals)} discounted "
+                  f"products \u00b7 {len(fresh)} passed your "
                   f"\u2265{MIN_DISCOUNT:.0f}% rule.")
         if ERRORS:
             status += "\n\n\u26A0\uFE0F Notes:\n" + "\n".join(
