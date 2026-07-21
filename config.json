@@ -2,9 +2,7 @@
   "min_discount_percent": 40,
   "max_alerts_per_run": 10,
   "searches_per_run": 8,
-
   "_comment": "amazon_searches = your net across the whole store. The bot checks 'searches_per_run' of them each run, then continues from where it stopped next time - so the full list gets swept over the day. Add or remove lines freely.",
-
   "amazon_searches": [
     "laptop",
     "gaming laptop",
@@ -77,11 +75,12 @@
     "pet supplies",
     "garden outdoor"
   ],
-
   "noon_pages": [
     "https://www.noon.com/uae-en/electronics-and-mobiles/",
     "https://www.noon.com/uae-en/home-and-kitchen/",
     "https://www.noon.com/uae-en/beauty-and-health/",
     "https://www.noon.com/uae-en/fashion/"
-  ]
+  ],
+  "noon_ultra_premium": true,
+  "_comment_noon": "noon_ultra_premium: uses ScraperAPI's strongest mode for Noon (more credits, but gets past their bot protection). Set to false if you want to save credits."
 }

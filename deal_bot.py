@@ -58,6 +58,8 @@ HEADERS = {
 }
 
 ERRORS = []
+NOON_DEBUG = []
+_seen_fingerprints = set()
 
 # ---------------------------------------------------------------- helpers
 
@@ -106,13 +108,41 @@ def clean_number(value):
     return n if 1 <= n <= 1_000_000 else None
 
 
-NOW_KEYS = ["price", "current_price", "sale_price", "salePrice",
-            "offer_price", "offerPrice", "final_price", "deal_price"]
+SALE_KEYS = ["sale_price", "salePrice", "offer_price", "offerPrice",
+             "final_price", "deal_price", "discounted_price", "current_price",
+             "special_price"]
+GENERIC_PRICE_KEYS = ["price", "amount", "value"]
 WAS_KEYS = ["original_price", "originalPrice", "old_price", "oldPrice",
             "list_price", "listPrice", "was_price", "wasPrice",
-            "strikethrough_price", "rrp", "msrp"]
+            "strikethrough_price", "rrp", "msrp", "regular_price"]
 NAME_KEYS = ["name", "title", "product_name", "productName", "product_title"]
 URL_KEYS = ["url", "link", "product_url", "productUrl", "href"]
+
+
+def read_prices(d):
+    """Work out the current price and the original price.
+
+    Stores are inconsistent: some use price=now + list_price=was, others use
+    price=was + sale_price=now. So we gather the candidates and let the
+    numbers decide - the lower one is always what you pay today.
+    """
+    sale = pick_number(d, SALE_KEYS)
+    generic = pick_number(d, GENERIC_PRICE_KEYS)
+    was = pick_number(d, WAS_KEYS)
+
+    candidates = [n for n in (sale, generic, was) if n]
+    if len(candidates) < 2:
+        return None, None
+    now_price = sale if sale else generic
+    old_price = was if was else max(candidates)
+    if not now_price:
+        return None, None
+    # if the "original" isn't actually higher, try the largest candidate
+    if old_price <= now_price:
+        old_price = max(candidates)
+    if old_price <= now_price:
+        return None, None
+    return now_price, old_price
 
 
 def pick_number(d, keys):
@@ -140,8 +170,7 @@ def harvest(obj, store, base_url, out):
     better than fixed rules.
     """
     if isinstance(obj, dict):
-        now = pick_number(obj, NOW_KEYS)
-        was = pick_number(obj, WAS_KEYS)
+        now, was = read_prices(obj)
         name = pick_text(obj, NAME_KEYS)
         if name and now and was and was > now:
             url = pick_text(obj, URL_KEYS) or ""
@@ -155,10 +184,12 @@ def harvest(obj, store, base_url, out):
                 else:
                     url = f"https://www.noon.com/uae-en/search/?q={q}"
             pct = round((was - now) / was * 100)
-            out.append({
-                "store": store, "name": name, "now": now,
-                "was": was, "pct": pct, "url": url,
-            })
+            entry = {"store": store, "name": name, "now": now,
+                     "was": was, "pct": pct, "url": url}
+            fingerprint = (store, name.lower()[:60], round(now, 2))
+            if fingerprint not in _seen_fingerprints:
+                _seen_fingerprints.add(fingerprint)
+                out.append(entry)
         for v in obj.values():
             harvest(v, store, base_url, out)
     elif isinstance(obj, list):
@@ -217,12 +248,13 @@ def check_amazon(queries):
 # ---------------------------------------------------------------- noon
 
 def fetch_page(url):
-    """Try fetching directly (free). If Noon blocks the request, fall back to
-    ScraperAPI - first the cheap simple fetch, then the heavy browser-rendered
-    fetch as a last resort."""
+    """Noon is heavily bot-protected, so we escalate: free direct fetch, then
+    cheap ScraperAPI, then browser-rendered, then ultra premium (which uses
+    the most credits but gets through the toughest protection)."""
     try:
         r = requests.get(url, headers=HEADERS, timeout=60)
         if r.status_code == 200 and "captcha" not in r.text[:3000].lower():
+            NOON_DEBUG.append("direct fetch ok")
             return r.text
     except Exception:
         pass
@@ -230,27 +262,110 @@ def fetch_page(url):
         ERRORS.append("Noon blocked the direct request and no SCRAPERAPI_KEY "
                       "is set to retry through.")
         return None
-    last_error = "unknown"
+
     attempts = [
-        # cheap and usually enough - Noon's product data is in the raw page
-        {"api_key": SCRAPER_KEY, "url": url, "country_code": "ae"},
-        # heavy fallback - loads the page in a real browser
-        {"api_key": SCRAPER_KEY, "url": url, "country_code": "ae",
-         "render": "true"},
+        ("plain", {"api_key": SCRAPER_KEY, "url": url, "country_code": "ae"}),
+        ("rendered", {"api_key": SCRAPER_KEY, "url": url,
+                      "country_code": "ae", "render": "true"}),
     ]
-    for params in attempts:
+    if CONFIG.get("noon_ultra_premium", True):
+        attempts.append(
+            ("ultra", {"api_key": SCRAPER_KEY, "url": url,
+                       "country_code": "ae", "render": "true",
+                       "ultra_premium": "true"}))
+
+    last_error = "unknown"
+    for label, params in attempts:
         try:
             r = requests.get("https://api.scraperapi.com/",
-                             params=params, timeout=180)
-            if r.status_code == 200:
+                             params=params, timeout=240)
+            if r.status_code == 200 and len(r.text) > 5000:
+                NOON_DEBUG.append(f"{label} ok ({len(r.text)//1024}kb)")
                 return r.text
-            last_error = f"HTTP {r.status_code}"
+            last_error = f"{label} HTTP {r.status_code}"
+            NOON_DEBUG.append(last_error)
         except Exception as e:
-            last_error = type(e).__name__
+            last_error = f"{label} {type(e).__name__}"
+            NOON_DEBUG.append(last_error)
         time.sleep(3)
-    ERRORS.append(f"Noon fetch failed this run ({last_error}) - "
-                  "it will retry automatically on the next scheduled run.")
+    ERRORS.append(f"Noon fetch failed ({last_error}) - will retry next run.")
     return None
+
+
+def json_blobs(html_text):
+    """Pull every chunk of product data out of a Noon page.
+
+    Noon is built on Next.js, which can deliver data three different ways
+    depending on the page and the day. We collect all three so a change on
+    their side doesn't blind the bot.
+    """
+    blobs = []
+
+    # 1. classic embedded JSON scripts
+    blobs += re.findall(
+        r'<script[^>]*type="application/(?:json|ld\+json)"[^>]*>(.*?)</script>',
+        html_text, re.DOTALL)
+
+    # 2. the older Next.js data island
+    m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>',
+                  html_text, re.DOTALL)
+    if m:
+        blobs.append(m.group(1))
+
+    # 3. the newer streamed format: self.__next_f.push([1,"...escaped json..."])
+    chunks = re.findall(r'self\.__next_f\.push\(\[1,\s*"((?:[^"\\]|\\.)*)"\]\)',
+                        html_text)
+    if chunks:
+        joined = "".join(json.loads('"' + c + '"') for c in chunks)
+        blobs.append(joined)  # not valid JSON on its own - scanned below
+
+    return blobs
+
+
+def scan_objects(text, store, base_url, out):
+    """Find product-shaped JSON objects inside a blob of text.
+
+    Instead of relying on the page layout, we look for every '"price"' and
+    read the JSON object surrounding it. This keeps working even when Noon
+    reshuffles their page structure.
+    """
+    if len(text) > 6_000_000:
+        text = text[:6_000_000]
+    found_before = len(out)
+    for m in re.finditer(r'"(?:price|sale_price|salePrice)"\s*:', text):
+        # walk backwards to the start of the enclosing object
+        start = text.rfind("{", max(0, m.start() - 4000), m.start())
+        if start == -1:
+            continue
+        depth, end, in_str, esc = 0, -1, False, False
+        for i in range(start, min(len(text), start + 8000)):
+            ch = text[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+        if end == -1:
+            continue
+        try:
+            obj = json.loads(text[start:end])
+        except Exception:
+            continue
+        harvest(obj, store, base_url, out)
+        if len(out) - found_before > 400:
+            break
 
 
 def check_noon():
@@ -259,28 +374,21 @@ def check_noon():
         html_text = fetch_page(page_url)
         if not html_text:
             continue
-        # Noon embeds its product data as JSON inside the page. Grab every
-        # JSON blob we can find and harvest products from all of them.
-        blobs = re.findall(
-            r'<script[^>]*type="application/json"[^>]*>(.*?)</script>',
-            html_text, re.DOTALL)
-        m = re.search(
-            r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>',
-            html_text, re.DOTALL)
-        if m:
-            blobs.append(m.group(1))
-        parsed_any = False
-        for blob in blobs:
+        before = len(found)
+        for blob in json_blobs(html_text):
             try:
-                data = json.loads(blob)
+                harvest(json.loads(blob), "Noon", "https://www.noon.com", found)
             except Exception:
-                continue
-            harvest(data, "Noon", "https://www.noon.com", found)
-            parsed_any = True
-        if parsed_any:
-            log(f"Noon page ok: {page_url}")
-        else:
-            ERRORS.append(f"Noon: couldn't read product data on {page_url}")
+                scan_objects(blob, "Noon", "https://www.noon.com", found)
+        # last resort: scan the raw page itself
+        if len(found) == before:
+            scan_objects(html_text, "Noon", "https://www.noon.com", found)
+        gained = len(found) - before
+        NOON_DEBUG.append(f"{page_url.rstrip('/').split('/')[-1]}: "
+                          f"{gained} products")
+        if gained == 0:
+            ERRORS.append(f"Noon: page loaded but no product data found "
+                          f"({page_url})")
         time.sleep(2)
     return found
 
@@ -353,6 +461,9 @@ def main():
                   f"(rotating) + Noon \u00b7 found {len(deals)} discounted "
                   f"products \u00b7 {len(fresh)} passed your "
                   f"\u2265{MIN_DISCOUNT:.0f}% rule.")
+        if NOON_DEBUG:
+            status += "\n\n\U0001F50D Noon trace:\n" + "\n".join(
+                "\u2022 " + html.escape(d) for d in NOON_DEBUG[:8])
         if ERRORS:
             status += "\n\n\u26A0\uFE0F Notes:\n" + "\n".join(
                 "\u2022 " + html.escape(e) for e in ERRORS[:6])
