@@ -2,9 +2,8 @@ name: Deal Falcon
 
 on:
   schedule:
-    # Runs at 9am, 3pm and 9pm UAE time (times below are UTC).
-    # Want more checks per day? Add more hours, e.g. "0 5,8,11,14,17 * * *"
-    - cron: "0 5,11,17 * * *"
+    # Every 3 hours (8 sweeps a day). Times are UTC; UAE is UTC+4.
+    - cron: "0 2,5,8,11,14,17,20,23 * * *"
   workflow_dispatch: {}
 
 permissions:
@@ -13,6 +12,7 @@ permissions:
 jobs:
   hunt:
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v5
 
@@ -23,11 +23,18 @@ jobs:
       - name: Install requirements
         run: pip install -r requirements.txt
 
+      - name: Install the free browser
+        run: python -m playwright install --with-deps chromium
+
       - name: Hunt for deals
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           SCRAPERAPI_KEY: ${{ secrets.SCRAPERAPI_KEY }}
+          SCRAPINGBEE_KEY: ${{ secrets.SCRAPINGBEE_KEY }}
+          ZENROWS_KEY: ${{ secrets.ZENROWS_KEY }}
+          SCRAPEDO_KEY: ${{ secrets.SCRAPEDO_KEY }}
+          SCRAPFLY_KEY: ${{ secrets.SCRAPFLY_KEY }}
         run: python deal_bot.py
 
       - name: Remember alerted deals
