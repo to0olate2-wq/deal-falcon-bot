@@ -152,11 +152,13 @@ def browser_fetch(url, scroll=True):
         return None, []
 
     captured = []
+    content = None
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(
                 args=["--disable-blink-features=AutomationControlled",
-                      "--no-sandbox", "--disable-dev-shm-usage"])
+                      "--no-sandbox", "--disable-dev-shm-usage",
+                      "--disable-gpu"])
             ctx = browser.new_context(
                 user_agent=HEADERS["User-Agent"],
                 locale="en-AE",
@@ -166,6 +168,16 @@ def browser_fetch(url, scroll=True):
             ctx.add_init_script(
                 "Object.defineProperty(navigator,'webdriver',"
                 "{get:()=>undefined})")
+
+            # skip images/fonts/video: we only want data, and heavy assets
+            # are the main cause of navigation timeouts
+            def block_heavy(route):
+                if route.request.resource_type in ("image", "media", "font"):
+                    route.abort()
+                else:
+                    route.continue_()
+            ctx.route("**/*", block_heavy)
+
             page = ctx.new_page()
 
             def on_response(resp):
@@ -177,18 +189,41 @@ def browser_fetch(url, scroll=True):
                     pass
 
             page.on("response", on_response)
-            page.goto(url, wait_until="domcontentloaded", timeout=70000)
-            page.wait_for_timeout(6000)
-            if scroll:
-                for _ in range(3):
-                    page.mouse.wheel(0, 5000)
-                    page.wait_for_timeout(2500)
-            content = page.content()
+
+            nav_error = None
+            for wait_mode in ("domcontentloaded", "commit"):
+                try:
+                    resp = page.goto(url, wait_until=wait_mode, timeout=60000)
+                    TRACE.append(
+                        f"browser: opened, HTTP {resp.status if resp else '?'}")
+                    nav_error = None
+                    break
+                except Exception as e:
+                    nav_error = f"{type(e).__name__}: {str(e)[:110]}"
+                    time.sleep(3)
+            if nav_error:
+                TRACE.append("browser: " + nav_error)
+
+            # even after a navigation error the page may hold usable data,
+            # so always try to read it rather than giving up
+            try:
+                page.wait_for_timeout(6000)
+                if scroll:
+                    for _ in range(3):
+                        page.mouse.wheel(0, 5000)
+                        page.wait_for_timeout(2500)
+                content = page.content()
+                if content and len(content) < 2000:
+                    TRACE.append(f"browser: tiny page ({len(content)} chars)"
+                                 " - likely blocked")
+            except Exception as e:
+                TRACE.append(f"browser read: {type(e).__name__}: "
+                             f"{str(e)[:100]}")
             browser.close()
         return content, captured
     except Exception as e:
-        TRACE.append(f"browser: {type(e).__name__}")
-        return None, []
+        TRACE.append(f"browser: {type(e).__name__}: {str(e)[:150]}")
+        return content, captured
 
 
 # ---------------------------------------------------------------- parsing
