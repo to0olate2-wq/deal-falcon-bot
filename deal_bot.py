@@ -155,10 +155,16 @@ def browser_fetch(url, scroll=True):
     content = None
     try:
         with sync_playwright() as p:
+            # Noon rejects Chromium's HTTP/2 connection (ERR_HTTP2_PROTOCOL_
+            # ERROR) but happily serves plain HTTP/1.1, so we turn HTTP/2 and
+            # QUIC off and let the browser fall back to 1.1.
             browser = p.chromium.launch(
                 args=["--disable-blink-features=AutomationControlled",
                       "--no-sandbox", "--disable-dev-shm-usage",
-                      "--disable-gpu"])
+                      "--disable-gpu",
+                      "--disable-http2",
+                      "--disable-quic",
+                      "--disable-features=UseChromiumHTTP2,AsyncDns"])
             ctx = browser.new_context(
                 user_agent=HEADERS["User-Agent"],
                 locale="en-AE",
