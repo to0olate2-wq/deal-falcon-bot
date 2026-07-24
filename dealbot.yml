@@ -1,0 +1,47 @@
+name: Deal Falcon
+
+on:
+  schedule:
+    # Runs every 3 hours (8 sweeps a day). Times are UTC; UAE is UTC+4.
+    # Add hours for more sweeps - but each sweep uses ~278 scraping credits.
+    - cron: "0 5,15 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  hunt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install requirements
+        run: pip install -r requirements.txt
+
+      - name: Install the free browser
+        run: python -m playwright install --with-deps chromium
+
+      - name: Hunt for deals
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SCRAPERAPI_KEY: ${{ secrets.SCRAPERAPI_KEY }}
+          SCRAPINGBEE_KEY: ${{ secrets.SCRAPINGBEE_KEY }}
+          ZENROWS_KEY: ${{ secrets.ZENROWS_KEY }}
+          SCRAPEDO_KEY: ${{ secrets.SCRAPEDO_KEY }}
+          SCRAPFLY_KEY: ${{ secrets.SCRAPFLY_KEY }}
+        run: python deal_bot.py
+
+      - name: Remember alerted deals
+        run: |
+          git config user.name "deal-falcon-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add state/seen.json
+          git commit -m "Update deal memory" || echo "Nothing new to remember"
+          git push || echo "Push skipped"

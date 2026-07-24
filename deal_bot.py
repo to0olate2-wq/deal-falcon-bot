@@ -69,6 +69,7 @@ HEADERS = {
 
 ERRORS = []
 TRACE = []
+SOURCES = {}
 _seen_fingerprints = set()
 
 
@@ -197,9 +198,9 @@ def browser_fetch(url, scroll=True):
             page.on("response", on_response)
 
             nav_error = None
-            for wait_mode in ("domcontentloaded", "commit"):
+            for wait_mode in ("domcontentloaded",):
                 try:
-                    resp = page.goto(url, wait_until=wait_mode, timeout=60000)
+                    resp = page.goto(url, wait_until=wait_mode, timeout=35000)
                     TRACE.append(
                         f"browser: opened, HTTP {resp.status if resp else '?'}")
                     nav_error = None
@@ -213,11 +214,11 @@ def browser_fetch(url, scroll=True):
             # even after a navigation error the page may hold usable data,
             # so always try to read it rather than giving up
             try:
-                page.wait_for_timeout(6000)
+                page.wait_for_timeout(4000)
                 if scroll:
-                    for _ in range(3):
-                        page.mouse.wheel(0, 5000)
-                        page.wait_for_timeout(2500)
+                    for _ in range(2):
+                        page.mouse.wheel(0, 6000)
+                        page.wait_for_timeout(1800)
                 content = page.content()
                 if content and len(content) < 2000:
                     TRACE.append(f"browser: tiny page ({len(content)} chars)"
@@ -443,6 +444,9 @@ def check_amazon(queries):
                 if r.status_code == 200:
                     harvest(r.json(), "Amazon.ae",
                             "https://www.amazon.ae", got)
+                    if got:
+                        SOURCES["scraperapi structured"] = (
+                            SOURCES.get("scraperapi structured", 0) + len(got))
             except Exception as e:
                 TRACE.append(f"amazon structured: {type(e).__name__}")
         # 2. any other provider, reading the normal search page
@@ -450,7 +454,7 @@ def check_amazon(queries):
             for name, page in call_providers(url, render=False):
                 got = parse_amazon_html(page)
                 if got:
-                    TRACE.append(f"amazon '{query}': {len(got)} via {name}")
+                    SOURCES[name] = SOURCES.get(name, 0) + len(got)
                     break
         # 3. free browser as the last resort
         if not got:
@@ -460,11 +464,12 @@ def check_amazon(queries):
                 for b in blobs:
                     harvest(b, "Amazon.ae", "https://www.amazon.ae", got)
                 if got:
-                    TRACE.append(f"amazon '{query}': {len(got)} via browser")
+                    SOURCES["free browser"] = (
+                        SOURCES.get("free browser", 0) + len(got))
         if not got:
-            TRACE.append(f"amazon '{query}': 0 found")
+            SOURCES["nothing worked"] = SOURCES.get("nothing worked", 0) + 1
         found += got
-        time.sleep(2)
+        time.sleep(1)
     return found
 
 
@@ -499,11 +504,12 @@ def check_noon(queries):
 # ---------------------------------------------------------------- rotation
 
 def rotate(terms, per_run, cursor):
-    """Return this run's slice of the keyword list, plus where to resume."""
+    """Return this run's slice of the keyword list, plus where to resume.
+    A per_run of 0 switches that store off completely."""
     terms = [t for t in terms if t and t.strip()]
-    if not terms:
-        return [], 0
-    if per_run <= 0 or per_run >= len(terms):
+    if not terms or per_run <= 0:
+        return [], cursor
+    if per_run >= len(terms):
         return terms, 0
     start = cursor % len(terms)
     doubled = terms + terms
@@ -586,9 +592,13 @@ def main():
                   f"Noon: {len(n_queries)}/{len(n_terms)} searches\n"
                   f"Found {len(deals)} discounted products \u00b7 "
                   f"{len(fresh)} passed your \u2265{MIN_DISCOUNT:.0f}% rule.")
+        if SOURCES:
+            status += "\n\n\U0001F4E1 Where the data came from:\n" + "\n".join(
+                f"\u2022 {html.escape(k)}: {v}"
+                for k, v in sorted(SOURCES.items(), key=lambda x: -x[1]))
         if TRACE:
             status += "\n\n\U0001F50D Trace:\n" + "\n".join(
-                "\u2022 " + html.escape(t) for t in TRACE[:14])
+                "\u2022 " + html.escape(t) for t in TRACE[:8])
         if ERRORS:
             status += "\n\n\u26A0\uFE0F Notes:\n" + "\n".join(
                 "\u2022 " + html.escape(e) for e in ERRORS[:5])
