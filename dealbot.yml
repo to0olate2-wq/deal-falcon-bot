@@ -2,8 +2,8 @@ name: Deal Falcon
 
 on:
   schedule:
-    # Runs every 3 hours (8 sweeps a day). Times are UTC; UAE is UTC+4.
-    # Add hours for more sweeps - but each sweep uses ~278 scraping credits.
+    # Twice a day: 9am and 7pm UAE time (UTC+4). Add hours for more sweeps,
+    # but each sweep uses roughly one scraping credit per category.
     - cron: "0 5,15 * * *"
   workflow_dispatch: {}
 
@@ -13,7 +13,7 @@ permissions:
 jobs:
   hunt:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
 
@@ -23,9 +23,6 @@ jobs:
 
       - name: Install requirements
         run: pip install -r requirements.txt
-
-      - name: Install the free browser
-        run: python -m playwright install --with-deps chromium
 
       - name: Hunt for deals
         env:
@@ -38,10 +35,11 @@ jobs:
           SCRAPFLY_KEY: ${{ secrets.SCRAPFLY_KEY }}
         run: python deal_bot.py
 
-      - name: Remember alerted deals
+      - name: Save settings and deal memory
         run: |
           git config user.name "deal-falcon-bot"
           git config user.email "actions@users.noreply.github.com"
-          git add state/seen.json
-          git commit -m "Update deal memory" || echo "Nothing new to remember"
+          git add state/seen.json || true
+          git commit -m "Update state" || echo "Nothing to save"
+          git pull --rebase --autostash || true
           git push || echo "Push skipped"
