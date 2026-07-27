@@ -1,18 +1,14 @@
 """
-Deal Falcon Bot - your personal UAE price-slash hunter.
+Deal Falcon Bot - your personal Amazon.ae price-slash hunter.
 
-Checks Amazon.ae and Noon for big discounts and sends Telegram alerts
-straight to your phone. Everything you might want to change lives in
-config.json - you never need to touch this file.
+Scans Amazon.ae for big discounts and sends Telegram alerts to your phone.
 
-How pages are fetched:
-  Noon    -> real browser (Playwright, FREE on GitHub) first, then any
-             scraping API key you have set.
-  Amazon  -> scraping API structured reader first (cheap + clean), then any
-             provider's plain fetch, then the free browser.
-You can run with NO scraping API key at all - the free browser handles it.
-Supported keys (add any ONE as a GitHub secret): SCRAPERAPI_KEY,
-SCRAPINGBEE_KEY, ZENROWS_KEY, SCRAPEDO_KEY, SCRAPFLY_KEY.
+You never need to edit this file:
+  * settings live in config.json
+  * or change them from your phone by messaging your bot (send /help)
+
+Needs ONE scraping key as a GitHub secret. Any of these works:
+  SCRAPERAPI_KEY, SCRAPINGBEE_KEY, ZENROWS_KEY, SCRAPEDO_KEY, SCRAPFLY_KEY
 """
 
 import html
@@ -34,94 +30,273 @@ CONFIG = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 IS_MANUAL_RUN = os.environ.get("GITHUB_EVENT_NAME", "") == "workflow_dispatch"
+COMMANDS_ONLY = "--commands-only" in sys.argv
 
 if not BOT_TOKEN or not CHAT_ID:
-    sys.exit("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID. "
-             "Add them as GitHub secrets (see README step 6).")
+    sys.exit("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID secret.")
 
-MIN_DISCOUNT = float(CONFIG.get("min_discount_percent", 40))
-MAX_ALERTS = int(CONFIG.get("max_alerts_per_run", 10))
-USE_BROWSER = bool(CONFIG.get("use_free_browser", True))
+DEFAULTS = {
+    "min_discount_percent": 30,
+    "max_discount_percent": 85,
+    "searches_per_run": 999,
+    "max_alerts_per_run": 25,
+}
 REMEMBER_DAYS = 7
+
+# ---------------------------------------------------------------- state
 
 STATE_FILE = ROOT / "state" / "seen.json"
 STATE_FILE.parent.mkdir(exist_ok=True)
-try:
-    _state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-except Exception:
-    _state = {}
-if isinstance(_state, dict) and "seen" in _state:
-    SEEN = _state.get("seen", {})
-    CURSOR = int(_state.get("cursor", 0))
-    NOON_CURSOR = int(_state.get("noon_cursor", 0))
-else:
-    SEEN = _state if isinstance(_state, dict) else {}
-    CURSOR = 0
-    NOON_CURSOR = 0
+
+
+def load_state():
+    try:
+        raw = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    # migrate older layouts without losing the deal memory
+    if "seen" not in raw:
+        raw = {"seen": raw if raw else {}}
+    raw.setdefault("seen", {})
+    raw.setdefault("settings", {})
+    raw.setdefault("cursor", 0)
+    raw.setdefault("last_update_id", 0)
+    raw.setdefault("paused", False)
+    return raw
+
+
+STATE = load_state()
+
+
+def setting(key):
+    """Telegram overrides win, then config.json, then the built-in default."""
+    v = STATE["settings"].get(key)
+    if v is None:
+        v = CONFIG.get(key)
+    if v is None:
+        v = DEFAULTS[key]
+    return float(v)
+
+
+def save_state():
+    STATE_FILE.write_text(json.dumps(STATE, indent=0), encoding="utf-8")
+
 
 HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                    "AppleWebKit/537.36 (KHTML, like Gecko) "
                    "Chrome/126.0.0.0 Safari/537.36"),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-AE,en;q=0.9,ar;q=0.8",
+    "Accept-Language": "en-AE,en;q=0.9",
 }
 
-ERRORS = []
 TRACE = []
 SOURCES = {}
-_seen_fingerprints = set()
+_fingerprints = set()
 
 
 def log(msg):
     print(msg, flush=True)
 
 
-# ------------------------------------------------- scraping providers
+# ---------------------------------------------------------------- telegram
 
-def provider_specs(url, render):
-    """Every scraping service the bot understands. Only ones whose key is
-    set as a GitHub secret are used, so you can switch provider by simply
-    adding a different secret - no code changes."""
+def send_telegram(text):
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML",
+                  "disable_web_page_preview": True}, timeout=30)
+        if r.status_code != 200:
+            log(f"Telegram error {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        log(f"Telegram send failed: {e}")
+
+
+HELP_TEXT = (
+    "\U0001F985 <b>Deal Falcon commands</b>\n\n"
+    "<b>/status</b> - show current settings\n"
+    "<b>/discount 35</b> - only alert me at 35% off or more\n"
+    "<b>/max 90</b> - ignore discounts above 90% (usually data errors)\n"
+    "<b>/alerts 30</b> - most deals in one message\n"
+    "<b>/categories 40</b> - categories per sweep (999 = all)\n"
+    "<b>/pause</b> - stop hunting\n"
+    "<b>/resume</b> - start hunting again\n"
+    "<b>/forget</b> - clear the memory of deals already sent\n"
+    "<b>/help</b> - this list"
+)
+
+
+def status_text():
+    total = len([t for t in CONFIG.get("amazon_searches", []) if t.strip()])
+    per = int(setting("searches_per_run"))
+    per_shown = "all" if per >= total else str(per)
+    return (
+        "\u2699\uFE0F <b>Current settings</b>\n"
+        f"Alert from: <b>{setting('min_discount_percent'):.0f}%</b> off\n"
+        f"Ignore above: <b>{setting('max_discount_percent'):.0f}%</b>\n"
+        f"Max alerts per message: <b>{int(setting('max_alerts_per_run'))}</b>\n"
+        f"Categories per sweep: <b>{per_shown}</b> (of {total})\n"
+        f"Hunting: <b>{'paused' if STATE['paused'] else 'active'}</b>\n"
+        f"Deals remembered: <b>{len(STATE['seen'])}</b>"
+    )
+
+
+def set_number(key, raw, low, high, label):
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return f"\u274C Give me a number, like <code>/{label} 35</code>"
+    if not (low <= v <= high):
+        return f"\u274C Pick a number between {low:.0f} and {high:.0f}."
+    STATE["settings"][key] = v
+    return None
+
+
+def apply_command(text):
+    """Handle one /command and return the reply to send back."""
+    parts = text.strip().split()
+    cmd = parts[0].lower().split("@")[0]
+    arg = parts[1] if len(parts) > 1 else None
+
+    if cmd in ("/help", "/start"):
+        return HELP_TEXT
+    if cmd == "/status":
+        return status_text()
+
+    if cmd == "/discount":
+        err = set_number("min_discount_percent", arg, 1, 99, "discount")
+        if err:
+            return err
+        lo = setting("min_discount_percent")
+        if lo >= setting("max_discount_percent"):
+            STATE["settings"]["max_discount_percent"] = min(99.0, lo + 10)
+        return (f"\u2705 Now alerting from <b>{lo:.0f}%</b> off.\n\n"
+                + status_text())
+
+    if cmd == "/max":
+        err = set_number("max_discount_percent", arg, 2, 100, "max")
+        if err:
+            return err
+        hi = setting("max_discount_percent")
+        if hi <= setting("min_discount_percent"):
+            STATE["settings"]["min_discount_percent"] = max(1.0, hi - 10)
+        return f"\u2705 Ignoring anything above <b>{hi:.0f}%</b> off."
+
+    if cmd == "/alerts":
+        err = set_number("max_alerts_per_run", arg, 1, 100, "alerts")
+        if err:
+            return err
+        return (f"\u2705 Up to <b>{int(setting('max_alerts_per_run'))}</b> "
+                "deals per message.")
+
+    if cmd == "/categories":
+        err = set_number("searches_per_run", arg, 1, 999, "categories")
+        if err:
+            return err
+        total = len([t for t in CONFIG.get("amazon_searches", []) if t.strip()])
+        per = int(setting("searches_per_run"))
+        if per >= total:
+            return (f"\u2705 Scanning <b>all {total}</b> categories every "
+                    "sweep.")
+        runs = -(-total // per)
+        return (f"\u2705 <b>{per}</b> categories per sweep - the full list is "
+                f"covered every {runs} sweeps.")
+
+    if cmd == "/pause":
+        STATE["paused"] = True
+        return "\u23F8 Hunting paused. Send /resume to start again."
+    if cmd == "/resume":
+        STATE["paused"] = False
+        return "\u25B6\uFE0F Hunting resumed."
+
+    if cmd == "/forget":
+        n = len(STATE["seen"])
+        STATE["seen"] = {}
+        return (f"\U0001F9F9 Forgot {n} remembered deals - you may see some "
+                "repeats on the next sweep.")
+
+    return "\u2753 Unknown command. Send /help for the list."
+
+
+def read_commands():
+    """Read any /commands you sent since the last run and apply them."""
+    offset = int(STATE.get("last_update_id", 0)) + 1
+    try:
+        r = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
+                         params={"offset": offset, "timeout": 0, "limit": 50},
+                         timeout=30)
+        data = r.json()
+    except Exception as e:
+        TRACE.append(f"commands: {type(e).__name__}")
+        return 0
+    if not data.get("ok"):
+        TRACE.append("commands: could not read messages")
+        return 0
+
+    handled = 0
+    for upd in data.get("result", []):
+        STATE["last_update_id"] = max(int(STATE.get("last_update_id", 0)),
+                                      int(upd.get("update_id", 0)))
+        msg = upd.get("message") or upd.get("edited_message") or {}
+        if str(msg.get("chat", {}).get("id", "")) != str(CHAT_ID):
+            continue
+        text = (msg.get("text") or "").strip()
+        if not text.startswith("/"):
+            continue
+        reply = apply_command(text)
+        if reply:
+            send_telegram(reply)
+        handled += 1
+    if handled:
+        TRACE.append(f"applied {handled} command(s)")
+    return handled
+
+
+# ---------------------------------------------------- scraping providers
+
+def provider_specs(url):
+    """Only services whose key is set as a GitHub secret are used, so you
+    can switch provider by adding a different secret - no code changes."""
     key = os.environ.get("SCRAPERAPI_KEY", "").strip()
     if key:
         yield ("scraperapi", "https://api.scraperapi.com/",
-               {"api_key": key, "url": url, "country_code": "ae",
-                "render": "true" if render else "false"}, None)
+               {"api_key": key, "url": url, "country_code": "ae"}, None)
 
     key = os.environ.get("SCRAPINGBEE_KEY", "").strip()
     if key:
         yield ("scrapingbee", "https://app.scrapingbee.com/api/v1/",
                {"api_key": key, "url": url, "country_code": "ae",
-                "render_js": "true" if render else "false"}, None)
+                "render_js": "false"}, None)
 
     key = os.environ.get("ZENROWS_KEY", "").strip()
     if key:
-        p = {"apikey": key, "url": url, "proxy_country": "ae"}
-        if render:
-            p["js_render"] = "true"
-        yield ("zenrows", "https://api.zenrows.com/v1/", p, None)
+        yield ("zenrows", "https://api.zenrows.com/v1/",
+               {"apikey": key, "url": url, "proxy_country": "ae"}, None)
 
     key = os.environ.get("SCRAPEDO_KEY", "").strip()
     if key:
-        p = {"token": key, "url": url, "geoCode": "ae"}
-        if render:
-            p["render"] = "true"
-        yield ("scrape.do", "https://api.scrape.do/", p, None)
+        yield ("scrape.do", "https://api.scrape.do/",
+               {"token": key, "url": url, "geoCode": "ae"}, None)
 
     key = os.environ.get("SCRAPFLY_KEY", "").strip()
     if key:
-        p = {"key": key, "url": url, "country": "ae", "asp": "true"}
-        if render:
-            p["render_js"] = "true"
-        yield ("scrapfly", "https://api.scrapfly.io/scrape", p, "scrapfly")
+        yield ("scrapfly", "https://api.scrapfly.io/scrape",
+               {"key": key, "url": url, "country": "ae", "asp": "true"},
+               "scrapfly")
 
 
-def call_providers(url, render=True):
-    """Try each configured provider in turn. Yields (name, html)."""
-    for name, endpoint, params, wrapper in provider_specs(url, render):
+def any_key_set():
+    return any(os.environ.get(k, "").strip() for k in (
+        "SCRAPERAPI_KEY", "SCRAPINGBEE_KEY", "ZENROWS_KEY",
+        "SCRAPEDO_KEY", "SCRAPFLY_KEY"))
+
+
+def call_providers(url):
+    for name, endpoint, params, wrapper in provider_specs(url):
         try:
-            r = requests.get(endpoint, params=params, timeout=240)
+            r = requests.get(endpoint, params=params, timeout=180)
             if r.status_code != 200:
                 TRACE.append(f"{name}: HTTP {r.status_code}")
                 continue
@@ -132,105 +307,6 @@ def call_providers(url, render=True):
                 yield name, text
         except Exception as e:
             TRACE.append(f"{name}: {type(e).__name__}")
-        time.sleep(1)
-
-
-# ------------------------------------------------- free browser (Playwright)
-
-def browser_fetch(url, scroll=True):
-    """Render a page in a real Chromium browser on GitHub's server. Free.
-
-    Returns (html, captured_json). We listen to the site's own background
-    data requests, which is far more reliable than reading the visible page,
-    because that is where the real product data travels.
-    """
-    if not USE_BROWSER:
-        return None, []
-    try:
-        from playwright.sync_api import sync_playwright
-    except Exception:
-        TRACE.append("browser: playwright not installed")
-        return None, []
-
-    captured = []
-    content = None
-    try:
-        with sync_playwright() as p:
-            # Noon rejects Chromium's HTTP/2 connection (ERR_HTTP2_PROTOCOL_
-            # ERROR) but happily serves plain HTTP/1.1, so we turn HTTP/2 and
-            # QUIC off and let the browser fall back to 1.1.
-            browser = p.chromium.launch(
-                args=["--disable-blink-features=AutomationControlled",
-                      "--no-sandbox", "--disable-dev-shm-usage",
-                      "--disable-gpu",
-                      "--disable-http2",
-                      "--disable-quic",
-                      "--disable-features=UseChromiumHTTP2,AsyncDns"])
-            ctx = browser.new_context(
-                user_agent=HEADERS["User-Agent"],
-                locale="en-AE",
-                timezone_id="Asia/Dubai",
-                viewport={"width": 1366, "height": 900},
-                extra_http_headers={"Accept-Language": "en-AE,en;q=0.9"})
-            ctx.add_init_script(
-                "Object.defineProperty(navigator,'webdriver',"
-                "{get:()=>undefined})")
-
-            # skip images/fonts/video: we only want data, and heavy assets
-            # are the main cause of navigation timeouts
-            def block_heavy(route):
-                if route.request.resource_type in ("image", "media", "font"):
-                    route.abort()
-                else:
-                    route.continue_()
-            ctx.route("**/*", block_heavy)
-
-            page = ctx.new_page()
-
-            def on_response(resp):
-                try:
-                    if resp.status == 200 and "json" in resp.headers.get(
-                            "content-type", "").lower():
-                        captured.append(resp.json())
-                except Exception:
-                    pass
-
-            page.on("response", on_response)
-
-            nav_error = None
-            for wait_mode in ("domcontentloaded",):
-                try:
-                    resp = page.goto(url, wait_until=wait_mode, timeout=35000)
-                    TRACE.append(
-                        f"browser: opened, HTTP {resp.status if resp else '?'}")
-                    nav_error = None
-                    break
-                except Exception as e:
-                    nav_error = f"{type(e).__name__}: {str(e)[:110]}"
-                    time.sleep(3)
-            if nav_error:
-                TRACE.append("browser: " + nav_error)
-
-            # even after a navigation error the page may hold usable data,
-            # so always try to read it rather than giving up
-            try:
-                page.wait_for_timeout(4000)
-                if scroll:
-                    for _ in range(2):
-                        page.mouse.wheel(0, 6000)
-                        page.wait_for_timeout(1800)
-                content = page.content()
-                if content and len(content) < 2000:
-                    TRACE.append(f"browser: tiny page ({len(content)} chars)"
-                                 " - likely blocked")
-            except Exception as e:
-                TRACE.append(f"browser read: {type(e).__name__}: "
-                             f"{str(e)[:100]}")
-            browser.close()
-        return content, captured
-    except Exception as e:
-        TRACE.append(f"browser: {type(e).__name__}: {str(e)[:150]}")
-        return content, captured
 
 
 # ---------------------------------------------------------------- parsing
@@ -304,103 +380,33 @@ def read_prices(d):
     return now_price, old_price
 
 
-def add_deal(out, store, name, now, was, url, base_url):
+def add_deal(out, name, now, was, url):
     if not (name and now and was and was > now):
         return
     if url and url.startswith("/"):
-        url = base_url.rstrip("/") + url
+        url = "https://www.amazon.ae" + url
     if not url or not url.startswith("http"):
-        q = urllib.parse.quote_plus(name[:80])
-        url = (f"https://www.amazon.ae/s?k={q}" if store == "Amazon.ae"
-               else f"https://www.noon.com/uae-en/search/?q={q}")
-    pct = round((was - now) / was * 100)
-    fp = (store, name.lower()[:60], round(now, 2))
-    if fp in _seen_fingerprints:
+        url = ("https://www.amazon.ae/s?k="
+               + urllib.parse.quote_plus(name[:80]))
+    fp = (name.lower()[:60], round(now, 2))
+    if fp in _fingerprints:
         return
-    _seen_fingerprints.add(fp)
-    out.append({"store": store, "name": name, "now": now, "was": was,
-                "pct": pct, "url": url})
+    _fingerprints.add(fp)
+    out.append({"name": name, "now": now, "was": was,
+                "pct": round((was - now) / was * 100), "url": url})
 
 
-def harvest(obj, store, base_url, out):
+def harvest(obj, out):
+    """Walk any JSON and pull out anything shaped like a discounted product."""
     if isinstance(obj, dict):
         now, was = read_prices(obj)
-        add_deal(out, store, pick_text(obj, NAME_KEYS), now, was,
-                 pick_text(obj, URL_KEYS) or "", base_url)
+        add_deal(out, pick_text(obj, NAME_KEYS), now, was,
+                 pick_text(obj, URL_KEYS) or "")
         for v in obj.values():
-            harvest(v, store, base_url, out)
+            harvest(v, out)
     elif isinstance(obj, list):
         for v in obj:
-            harvest(v, store, base_url, out)
-
-
-def json_blobs(html_text):
-    blobs = re.findall(
-        r'<script[^>]*type="application/(?:json|ld\+json)"[^>]*>(.*?)</script>',
-        html_text, re.DOTALL)
-    m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>',
-                  html_text, re.DOTALL)
-    if m:
-        blobs.append(m.group(1))
-    chunks = re.findall(
-        r'self\.__next_f\.push\(\[\d+\s*,\s*"((?:[^"\\]|\\.)*)"', html_text)
-    if chunks:
-        try:
-            blobs.append("".join(json.loads('"' + c + '"') for c in chunks))
-        except Exception:
-            pass
-    return blobs
-
-
-def scan_objects(text, store, base_url, out):
-    """Find product-shaped JSON objects anywhere in a blob of text."""
-    if len(text) > 6_000_000:
-        text = text[:6_000_000]
-    before = len(out)
-    for m in re.finditer(r'"(?:price|sale_price|salePrice)"\s*:', text):
-        start = text.rfind("{", max(0, m.start() - 4000), m.start())
-        if start == -1:
-            continue
-        depth, end, in_str, esc = 0, -1, False, False
-        for i in range(start, min(len(text), start + 8000)):
-            ch = text[i]
-            if in_str:
-                if esc:
-                    esc = False
-                elif ch == "\\":
-                    esc = True
-                elif ch == '"':
-                    in_str = False
-                continue
-            if ch == '"':
-                in_str = True
-            elif ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    end = i + 1
-                    break
-        if end == -1:
-            continue
-        try:
-            harvest(json.loads(text[start:end]), store, base_url, out)
-        except Exception:
-            continue
-        if len(out) - before > 400:
-            break
-
-
-def parse_page(html_text, store, base_url):
-    items = []
-    for blob in json_blobs(html_text):
-        try:
-            harvest(json.loads(blob), store, base_url, items)
-        except Exception:
-            scan_objects(blob, store, base_url, items)
-    if not items:
-        scan_objects(html_text, store, base_url, items)
-    return items
+            harvest(v, out)
 
 
 def parse_amazon_html(html_text):
@@ -421,12 +427,11 @@ def parse_amazon_html(html_text):
         if len(prices) < 2:
             continue
         url = f"https://www.amazon.ae/dp/{asin}" if asin else ""
-        add_deal(out, "Amazon.ae", name, min(prices), max(prices), url,
-                 "https://www.amazon.ae")
+        add_deal(out, name, min(prices), max(prices), url)
     return out
 
 
-# ---------------------------------------------------------------- stores
+# ---------------------------------------------------------------- hunting
 
 def check_amazon(queries):
     found = []
@@ -442,70 +447,28 @@ def check_amazon(queries):
                     params={"api_key": sapi, "query": query,
                             "tld": "ae", "country": "ae"}, timeout=120)
                 if r.status_code == 200:
-                    harvest(r.json(), "Amazon.ae",
-                            "https://www.amazon.ae", got)
+                    harvest(r.json(), got)
                     if got:
-                        SOURCES["scraperapi structured"] = (
-                            SOURCES.get("scraperapi structured", 0) + len(got))
+                        SOURCES["scraperapi structured"] = SOURCES.get(
+                            "scraperapi structured", 0) + len(got)
             except Exception as e:
-                TRACE.append(f"amazon structured: {type(e).__name__}")
+                TRACE.append(f"structured: {type(e).__name__}")
         # 2. any other provider, reading the normal search page
         if not got:
-            for name, page in call_providers(url, render=False):
+            for name, page in call_providers(url):
                 got = parse_amazon_html(page)
                 if got:
                     SOURCES[name] = SOURCES.get(name, 0) + len(got)
                     break
-        # 3. free browser as the last resort
         if not got:
-            page, blobs = browser_fetch(url, scroll=True)
-            if page:
-                got = parse_amazon_html(page)
-                for b in blobs:
-                    harvest(b, "Amazon.ae", "https://www.amazon.ae", got)
-                if got:
-                    SOURCES["free browser"] = (
-                        SOURCES.get("free browser", 0) + len(got))
-        if not got:
-            SOURCES["nothing worked"] = SOURCES.get("nothing worked", 0) + 1
+            SOURCES["nothing found"] = SOURCES.get("nothing found", 0) + 1
         found += got
         time.sleep(1)
     return found
 
 
-def check_noon(queries):
-    found = []
-    for query in queries:
-        url = ("https://www.noon.com/uae-en/search/?q="
-               + urllib.parse.quote_plus(query))
-        got = []
-        # 1. free real browser, capturing Noon's own data requests
-        page, blobs = browser_fetch(url, scroll=True)
-        for b in blobs:
-            harvest(b, "Noon", "https://www.noon.com", got)
-        if not got and page:
-            got = parse_page(page, "Noon", "https://www.noon.com")
-        if got:
-            TRACE.append(f"noon '{query}': {len(got)} via browser")
-        # 2. paid providers, fully rendered
-        if not got:
-            for name, page in call_providers(url, render=True):
-                got = parse_page(page, "Noon", "https://www.noon.com")
-                if got:
-                    TRACE.append(f"noon '{query}': {len(got)} via {name}")
-                    break
-        if not got:
-            TRACE.append(f"noon '{query}': 0 found")
-        found += got
-        time.sleep(2)
-    return found
-
-
-# ---------------------------------------------------------------- rotation
-
 def rotate(terms, per_run, cursor):
-    """Return this run's slice of the keyword list, plus where to resume.
-    A per_run of 0 switches that store off completely."""
+    """This run's slice of the keyword list, plus where to resume."""
     terms = [t for t in terms if t and t.strip()]
     if not terms or per_run <= 0:
         return [], cursor
@@ -516,61 +479,74 @@ def rotate(terms, per_run, cursor):
     return doubled[start:start + per_run], (start + per_run) % len(terms)
 
 
-# ---------------------------------------------------------------- telegram
-
-def send_telegram(text):
-    try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML",
-                  "disable_web_page_preview": True}, timeout=30)
-        if r.status_code != 200:
-            log(f"Telegram error: {r.status_code} {r.text[:200]}")
-    except Exception as e:
-        log(f"Telegram send failed: {e}")
-
-
 # ---------------------------------------------------------------- main
 
 def main():
-    a_terms = CONFIG.get("amazon_searches", [])
-    n_terms = CONFIG.get("noon_searches", [])
-    a_queries, a_next = rotate(
-        a_terms, int(CONFIG.get("searches_per_run", 10)), CURSOR)
-    n_queries, n_next = rotate(
-        n_terms, int(CONFIG.get("noon_searches_per_run", 4)), NOON_CURSOR)
-    log(f"Amazon slice ({len(a_queries)}/{len(a_terms)}): {a_queries}")
-    log(f"Noon slice ({len(n_queries)}/{len(n_terms)}): {n_queries}")
+    read_commands()
 
-    deals = check_amazon(a_queries) + check_noon(n_queries)
+    if COMMANDS_ONLY:
+        save_state()
+        log("Commands processed.")
+        return
+
+    if STATE["paused"]:
+        save_state()
+        if IS_MANUAL_RUN:
+            send_telegram("\u23F8 Hunting is paused. Send /resume to start "
+                          "again.")
+        log("Paused - no hunting this run.")
+        return
+
+    min_pct = setting("min_discount_percent")
+    max_pct = setting("max_discount_percent")
+    terms = CONFIG.get("amazon_searches", [])
+    queries, next_cursor = rotate(terms, int(setting("searches_per_run")),
+                                  int(STATE["cursor"]))
+    log(f"Scanning {len(queries)} of {len(terms)} categories")
+
+    if not any_key_set():
+        send_telegram(
+            "\u26A0\uFE0F No scraping key found. Amazon blocks plain requests, "
+            "so the bot cannot read prices.\nAdd one GitHub secret named "
+            "SCRAPERAPI_KEY, SCRAPINGBEE_KEY, ZENROWS_KEY, SCRAPEDO_KEY or "
+            "SCRAPFLY_KEY.")
+        save_state()
+        return
+
+    deals = check_amazon(queries)
     log(f"Discounted products found: {len(deals)}")
 
-    hot = [d for d in deals if d["pct"] >= MIN_DISCOUNT]
+    hot = [d for d in deals if min_pct <= d["pct"] <= max_pct]
+    skipped = len([d for d in deals if d["pct"] > max_pct])
+    if skipped:
+        TRACE.append(f"skipped {skipped} results above {max_pct:.0f}% "
+                     "(usually size/colour price ranges, not real deals)")
+
     now_ts = time.time()
     fresh = []
     for d in sorted(hot, key=lambda x: -x["pct"]):
-        key = f"{d['store']}|{d['name'][:60].lower()}|{int(d['now'])}"
-        if now_ts - SEEN.get(key, 0) < REMEMBER_DAYS * 86400:
+        key = f"{d['name'][:60].lower()}|{int(d['now'])}"
+        if now_ts - STATE["seen"].get(key, 0) < REMEMBER_DAYS * 86400:
             continue
         fresh.append((key, d))
 
-    alerts = fresh[:MAX_ALERTS]
-    log(f"Deals >= {MIN_DISCOUNT:.0f}% off, new this week: {len(fresh)}")
+    alerts = fresh[:int(setting("max_alerts_per_run"))]
+    log(f"New deals >= {min_pct:.0f}%: {len(fresh)} (sending {len(alerts)})")
 
     if alerts:
         lines = []
         for key, d in alerts:
-            SEEN[key] = now_ts
+            STATE["seen"][key] = now_ts
             lines.append(
-                f"\U0001F525 <b>\u2212{d['pct']}%</b> \u00b7 {d['store']}\n"
+                f"\U0001F525 <b>\u2212{d['pct']}%</b>\n"
                 f"{html.escape(d['name'][:90])}\n"
                 f"<b>AED {d['now']:,.0f}</b>  <s>AED {d['was']:,.0f}</s>"
                 f"  (save AED {d['was'] - d['now']:,.0f})\n"
                 f"<a href=\"{html.escape(d['url'], quote=True)}\">"
-                f"Open product \u2197</a>")
-        chunk = (f"\U0001F985 <b>Deal Falcon</b> \u2014 {len(alerts)} slash"
-                 f"{'es' if len(alerts) > 1 else ''} \u2265 "
-                 f"{MIN_DISCOUNT:.0f}% off\n\n")
+                f"Open on Amazon \u2197</a>")
+        chunk = (f"\U0001F985 <b>Deal Falcon</b> \u2014 {len(alerts)} deal"
+                 f"{'s' if len(alerts) > 1 else ''} \u2265 {min_pct:.0f}% off"
+                 "\n\n")
         for line in lines:
             if len(chunk) + len(line) > 3500:
                 send_telegram(chunk)
@@ -579,29 +555,25 @@ def main():
         if chunk.strip():
             send_telegram(chunk)
 
-    for k in [k for k, ts in SEEN.items()
+    STATE["cursor"] = next_cursor
+    for k in [k for k, ts in STATE["seen"].items()
               if now_ts - ts > REMEMBER_DAYS * 86400]:
-        del SEEN[k]
-    STATE_FILE.write_text(
-        json.dumps({"cursor": a_next, "noon_cursor": n_next, "seen": SEEN},
-                   indent=0), encoding="utf-8")
+        del STATE["seen"][k]
+    save_state()
 
     if IS_MANUAL_RUN:
         status = (f"\u2705 Deal Falcon is alive.\n"
-                  f"Amazon: {len(a_queries)}/{len(a_terms)} searches \u00b7 "
-                  f"Noon: {len(n_queries)}/{len(n_terms)} searches\n"
-                  f"Found {len(deals)} discounted products \u00b7 "
-                  f"{len(fresh)} passed your \u2265{MIN_DISCOUNT:.0f}% rule.")
+                  f"Scanned {len(queries)}/{len(terms)} categories \u00b7 "
+                  f"found {len(deals)} discounted products \u00b7 "
+                  f"{len(fresh)} passed your \u2265{min_pct:.0f}% rule.")
         if SOURCES:
-            status += "\n\n\U0001F4E1 Where the data came from:\n" + "\n".join(
+            status += "\n\n\U0001F4E1 Data came from:\n" + "\n".join(
                 f"\u2022 {html.escape(k)}: {v}"
                 for k, v in sorted(SOURCES.items(), key=lambda x: -x[1]))
         if TRACE:
-            status += "\n\n\U0001F50D Trace:\n" + "\n".join(
-                "\u2022 " + html.escape(t) for t in TRACE[:8])
-        if ERRORS:
-            status += "\n\n\u26A0\uFE0F Notes:\n" + "\n".join(
-                "\u2022 " + html.escape(e) for e in ERRORS[:5])
+            status += "\n\n\U0001F50D Notes:\n" + "\n".join(
+                "\u2022 " + html.escape(t) for t in TRACE[:6])
+        status += "\n\nSend /help to change settings from here."
         send_telegram(status)
 
     for t in TRACE:
