@@ -1,0 +1,45 @@
+name: Deal Falcon Commands
+
+# Checks every 30 minutes for /commands you send the bot in Telegram.
+# Uses no scraping credits - it only reads your messages.
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: deal-falcon-state
+  cancel-in-progress: false
+
+jobs:
+  commands:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install requirements
+        run: pip install -r requirements.txt
+
+      - name: Read Telegram commands
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python deal_bot.py --commands-only
+
+      - name: Save settings
+        run: |
+          git config user.name "deal-falcon-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add state/seen.json || true
+          git commit -m "Update settings from Telegram" || echo "No changes"
+          git pull --rebase --autostash || true
+          git push || echo "Push skipped"
