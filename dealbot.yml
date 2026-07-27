@@ -2,8 +2,6 @@ name: Deal Falcon
 
 on:
   schedule:
-    # Twice a day: 9am and 7pm UAE time (UTC+4). Add hours for more sweeps,
-    # but each sweep uses roughly one scraping credit per category.
     - cron: "0 5,15 * * *"
   workflow_dispatch: {}
 
