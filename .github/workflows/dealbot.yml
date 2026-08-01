@@ -30,6 +30,7 @@ jobs:
           SCRAPINGBEE_KEY: ${{ secrets.SCRAPINGBEE_KEY }}
           ZENROWS_KEY: ${{ secrets.ZENROWS_KEY }}
           SCRAPEDO_KEY: ${{ secrets.SCRAPEDO_KEY }}
+          SCRAPINGANT_KEY: ${{ secrets.SCRAPINGANT_KEY }}
           SCRAPFLY_KEY: ${{ secrets.SCRAPFLY_KEY }}
         run: python deal_bot.py
 
