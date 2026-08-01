@@ -35,6 +35,22 @@ COMMANDS_ONLY = "--commands-only" in sys.argv
 if not BOT_TOKEN or not CHAT_ID:
     sys.exit("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID secret.")
 
+# CHAT_ID is you: settings replies and error notices always go here privately.
+# post_to in config.json is where the DEALS go - set it to a public channel
+# (e.g. "@MyUaeDeals") and anyone who joins that channel sees the deals.
+# Leave it empty and deals come to you privately, as before.
+def post_target():
+    """Where DEALS go. A /post command wins, then config.json, then you."""
+    v = STATE["settings"].get("post_to")
+    if v is None:
+        v = CONFIG.get("post_to")
+    v = str(v or "").strip()
+    return v or CHAT_ID
+
+
+def posting_elsewhere():
+    return str(post_target()) != str(CHAT_ID)
+
 DEFAULTS = {
     "min_discount_percent": 30,
     "max_discount_percent": 85,
@@ -64,6 +80,7 @@ def load_state():
     raw.setdefault("cursor", 0)
     raw.setdefault("last_update_id", 0)
     raw.setdefault("paused", False)
+    raw.setdefault("known_chats", {})
     return raw
 
 
@@ -102,16 +119,49 @@ def log(msg):
 
 # ---------------------------------------------------------------- telegram
 
-def send_telegram(text):
+_WARNED_OWNER = False
+
+
+def _post(target, text):
+    r = requests.post(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+        json={"chat_id": target, "text": text, "parse_mode": "HTML",
+              "disable_web_page_preview": True}, timeout=30)
+    return r
+
+
+def _warn_owner(target, detail):
+    """If the channel rejects us, tell the owner privately - once."""
+    global _WARNED_OWNER
+    if _WARNED_OWNER:
+        return
+    _WARNED_OWNER = True
     try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML",
-                  "disable_web_page_preview": True}, timeout=30)
-        if r.status_code != 200:
-            log(f"Telegram error {r.status_code}: {r.text[:200]}")
+        _post(CHAT_ID,
+              f"\u26A0\uFE0F Could not post to <b>{html.escape(str(target))}"
+              "</b>.\nCheck that the channel exists and that this bot is an "
+              "<b>administrator</b> of it with permission to post messages."
+              f"\n\n<code>{html.escape(detail[:200])}</code>")
+    except Exception:
+        pass
+
+
+def send_telegram(text, to=None, warn=True):
+    """Deals go to POST_TO (your public channel, if set). Settings replies
+    and warnings go to the owner by passing to=CHAT_ID."""
+    target = to or post_target()
+    detail = ""
+    try:
+        r = _post(target, text)
+        if r.status_code == 200:
+            return True
+        detail = f"HTTP {r.status_code}: {r.text[:180]}"
     except Exception as e:
-        log(f"Telegram send failed: {e}")
+        detail = f"{type(e).__name__}: {e}"
+    log(f"Telegram send to {target} failed - {detail}")
+    if warn and str(target) != str(CHAT_ID):
+        _warn_owner(target, detail)
+    return False
 
 
 HELP_TEXT = (
@@ -123,6 +173,8 @@ HELP_TEXT = (
     "<b>/categories 40</b> - categories per sweep (999 = all)\n"
     "<b>/pause</b> - stop hunting\n"
     "<b>/resume</b> - start hunting again\n"
+    "<b>/post -100123...</b> - post deals to a channel instead\n"
+    "<b>/private</b> - bring deals back to this chat\n"
     "<b>/forget</b> - clear the memory of deals already sent\n"
     "<b>/help</b> - this list"
 )
@@ -139,7 +191,10 @@ def status_text():
         f"Max alerts per message: <b>{int(setting('max_alerts_per_run'))}</b>\n"
         f"Categories per sweep: <b>{per_shown}</b> (of {total})\n"
         f"Hunting: <b>{'paused' if STATE['paused'] else 'active'}</b>\n"
-        f"Deals remembered: <b>{len(STATE['seen'])}</b>"
+        f"Deals remembered: <b>{len(STATE['seen'])}</b>\n"
+        f"Deals posted to: <b>"
+        + (html.escape(str(post_target())) if posting_elsewhere()
+           else "this chat") + "</b>"
     )
 
 
@@ -204,6 +259,32 @@ def apply_command(text):
         return (f"\u2705 <b>{per}</b> categories per sweep - the full list is "
                 f"covered every {runs} sweeps.")
 
+    if cmd == "/post":
+        if not arg:
+            return ("Send the channel ID after the command, like\n"
+                    "<code>/post -1001234567890</code>\n\n"
+                    "Add me as an administrator of your channel and I'll "
+                    "message you its ID automatically.")
+        had = "post_to" in STATE["settings"]
+        old = STATE["settings"].get("post_to")
+        STATE["settings"]["post_to"] = arg
+        if send_telegram("\U0001F985 Deal Falcon will post deals here.",
+                         to=arg, warn=False):
+            return (f"\u2705 Deals will now go to <b>{html.escape(arg)}</b>.\n"
+                    "Settings replies stay here with you.\n"
+                    "Send /private to bring deals back to this chat.")
+        if had:
+            STATE["settings"]["post_to"] = old
+        else:
+            STATE["settings"].pop("post_to", None)
+        return ("\u274C I couldn't post there. Check that I'm an "
+                "<b>administrator</b> of that channel with permission to post "
+                "messages, then send the command again.")
+
+    if cmd == "/private":
+        STATE["settings"]["post_to"] = ""
+        return "\u2705 Deals will come to this chat only."
+
     if cmd == "/pause":
         STATE["paused"] = True
         return "\u23F8 Hunting paused. Send /resume to start again."
@@ -218,6 +299,20 @@ def apply_command(text):
                 "repeats on the next sweep.")
 
     return "\u2753 Unknown command. Send /help for the list."
+
+
+def announce_chat(chat):
+    """Tell the owner privately about a channel the bot can now post to."""
+    cid = str(chat.get("id", ""))
+    if not cid or cid in STATE["known_chats"]:
+        return
+    STATE["known_chats"][cid] = chat.get("title", "")
+    title = html.escape(chat.get("title") or "your channel")
+    send_telegram(
+        f"\U0001F4E3 I've been added to <b>{title}</b>.\n"
+        f"Its ID is <code>{html.escape(cid)}</code>\n\n"
+        f"To send deals there, reply:\n<code>/post {html.escape(cid)}</code>",
+        to=CHAT_ID)
 
 
 def read_commands():
@@ -239,6 +334,15 @@ def read_commands():
     for upd in data.get("result", []):
         STATE["last_update_id"] = max(int(STATE.get("last_update_id", 0)),
                                       int(upd.get("update_id", 0)))
+        # if I've just been added to a channel or group, tell the owner its
+        # ID so they never have to hunt for it
+        member = upd.get("my_chat_member") or {}
+        post = upd.get("channel_post") or {}
+        found = member.get("chat") or post.get("chat") or {}
+        if found.get("type") in ("channel", "group", "supergroup"):
+            announce_chat(found)
+            continue
+
         msg = upd.get("message") or upd.get("edited_message") or {}
         if str(msg.get("chat", {}).get("id", "")) != str(CHAT_ID):
             continue
@@ -247,7 +351,7 @@ def read_commands():
             continue
         reply = apply_command(text)
         if reply:
-            send_telegram(reply)
+            send_telegram(reply, to=CHAT_ID)
         handled += 1
     if handled:
         TRACE.append(f"applied {handled} command(s)")
@@ -280,6 +384,19 @@ def provider_specs(url):
         yield ("scrape.do", "https://api.scrape.do/",
                {"token": key, "url": url, "geoCode": "ae"}, None)
 
+    key = os.environ.get("SCRAPINGANT_KEY", "").strip()
+    if key:
+        # cheap first: no browser rendering costs 1 credit instead of 10,
+        # and Amazon search pages carry prices in plain HTML anyway
+        yield ("scrapingant", "https://api.scrapingant.com/v2/general",
+               {"x-api-key": key, "url": url, "browser": "false",
+                "proxy_country": "ae"}, None)
+        # only reached if the cheap attempt found nothing
+        yield ("scrapingant+browser", "https://api.scrapingant.com/v2/general",
+               {"x-api-key": key, "url": url, "browser": "true",
+                "proxy_country": "ae", "block_resource": "image,media,font"},
+               None)
+
     key = os.environ.get("SCRAPFLY_KEY", "").strip()
     if key:
         yield ("scrapfly", "https://api.scrapfly.io/scrape",
@@ -287,10 +404,22 @@ def provider_specs(url):
                "scrapfly")
 
 
+KEY_NAMES = {
+    "SCRAPERAPI_KEY": "scraperapi",
+    "SCRAPINGBEE_KEY": "scrapingbee",
+    "ZENROWS_KEY": "zenrows",
+    "SCRAPEDO_KEY": "scrape.do",
+    "SCRAPINGANT_KEY": "scrapingant",
+    "SCRAPFLY_KEY": "scrapfly",
+}
+
+
+def keys_detected():
+    return [v for k, v in KEY_NAMES.items() if os.environ.get(k, "").strip()]
+
+
 def any_key_set():
-    return any(os.environ.get(k, "").strip() for k in (
-        "SCRAPERAPI_KEY", "SCRAPINGBEE_KEY", "ZENROWS_KEY",
-        "SCRAPEDO_KEY", "SCRAPFLY_KEY"))
+    return bool(keys_detected())
 
 
 def call_providers(url):
@@ -493,7 +622,7 @@ def main():
         save_state()
         if IS_MANUAL_RUN:
             send_telegram("\u23F8 Hunting is paused. Send /resume to start "
-                          "again.")
+                          "again.", to=CHAT_ID)
         log("Paused - no hunting this run.")
         return
 
@@ -506,10 +635,14 @@ def main():
 
     if not any_key_set():
         send_telegram(
-            "\u26A0\uFE0F No scraping key found. Amazon blocks plain requests, "
-            "so the bot cannot read prices.\nAdd one GitHub secret named "
-            "SCRAPERAPI_KEY, SCRAPINGBEE_KEY, ZENROWS_KEY, SCRAPEDO_KEY or "
-            "SCRAPFLY_KEY.")
+            "\u26A0\uFE0F No scraping key reached me. Amazon blocks plain "
+            "requests, so I cannot read prices.\n\nI support these secret "
+            "names:\n"
+            + "\n".join(f"\u2022 <code>{k}</code>" for k in KEY_NAMES)
+            + "\n\nTwo things to check:\n1. The secret's NAME is spelled "
+              "exactly as above.\n2. The same name appears in the <b>env:</b> "
+              "block of <code>.github/workflows/dealbot.yml</code> - a secret "
+              "GitHub doesn't pass through never reaches me.", to=CHAT_ID)
         save_state()
         return
 
@@ -570,11 +703,23 @@ def main():
             status += "\n\n\U0001F4E1 Data came from:\n" + "\n".join(
                 f"\u2022 {html.escape(k)}: {v}"
                 for k, v in sorted(SOURCES.items(), key=lambda x: -x[1]))
+        found = keys_detected()
+        status += ("\n\n\U0001F511 Keys detected: "
+                   + (", ".join(found) if found else "none"))
         if TRACE:
+            counts = {}
+            for t in TRACE:
+                counts[t] = counts.get(t, 0) + 1
             status += "\n\n\U0001F50D Notes:\n" + "\n".join(
-                "\u2022 " + html.escape(t) for t in TRACE[:6])
+                f"\u2022 {html.escape(k)}"
+                + (f" (x{v})" if v > 1 else "")
+                for k, v in sorted(counts.items(), key=lambda x: -x[1])[:8])
+            if any("401" in k or "403" in k for k in counts):
+                status += ("\n\n\u26A0\uFE0F A 401/403 means the key was "
+                           "rejected. Check the secret's NAME matches your "
+                           "provider, and that the key is still active.")
         status += "\n\nSend /help to change settings from here."
-        send_telegram(status)
+        send_telegram(status, to=CHAT_ID)
 
     for t in TRACE:
         log("TRACE: " + t)
