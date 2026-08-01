@@ -1,0 +1,46 @@
+name: Deal Falcon
+
+on:
+  schedule:
+    # Twice a day: 9am and 7pm UAE time (UTC+4). Add hours for more sweeps,
+    # but each sweep uses roughly one scraping credit per category.
+    - cron: "0 5,15 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  hunt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install requirements
+        run: pip install -r requirements.txt
+
+      - name: Hunt for deals
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SCRAPERAPI_KEY: ${{ secrets.SCRAPERAPI_KEY }}
+          SCRAPINGBEE_KEY: ${{ secrets.SCRAPINGBEE_KEY }}
+          ZENROWS_KEY: ${{ secrets.ZENROWS_KEY }}
+          SCRAPEDO_KEY: ${{ secrets.SCRAPEDO_KEY }}
+          SCRAPINGANT_KEY: ${{ secrets.SCRAPINGANT_KEY }}
+          SCRAPFLY_KEY: ${{ secrets.SCRAPFLY_KEY }}
+        run: python deal_bot.py
+
+      - name: Save settings and deal memory
+        run: |
+          git config user.name "deal-falcon-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add state/seen.json || true
+          git commit -m "Update state" || echo "Nothing to save"
+          git pull --rebase --autostash || true
+          git push || echo "Push skipped"
