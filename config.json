@@ -6,8 +6,12 @@
   "_README_3": "^^ Ignore anything above this - over 85% is usually a data error, not a real deal. Telegram: /max 90",
   "searches_per_run": 999,
   "_README_4": "^^ How many categories per run. 999 = all of them. Telegram: /categories 40",
+  "browser_retries_per_run": 25,
+  "_README_4b": "^^ If a category comes back empty, retry it with full browser rendering. That costs about 10x a normal fetch, so this caps how many retries per run. Set to 0 to never retry.",
   "max_alerts_per_run": 25,
   "_README_5": "^^ Most deals in one message, so it never floods your phone. Telegram: /alerts 30",
+  "post_to": "",
+  "_README_5b": "^^ WHERE THE DEALS GO. Leave empty and they come to you privately. Easiest way to use a channel: add this bot as an administrator of your channel and it will message you the channel's ID, then send it /post <id>. You can also paste the ID or a public @username here directly.",
   "_README_6": "===== END OF SETTINGS - below is just the keyword list =====",
   "amazon_searches": [
     "air fryer",

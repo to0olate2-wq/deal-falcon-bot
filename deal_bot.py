@@ -110,6 +110,9 @@ HEADERS = {
 
 TRACE = []
 SOURCES = {}
+# browser rendering costs about 10x a plain fetch, so cap how many times
+# per run we fall back to it
+BROWSER_BUDGET = [int(CONFIG.get("browser_retries_per_run", 25))]
 _fingerprints = set()
 
 
@@ -391,11 +394,13 @@ def provider_specs(url):
         yield ("scrapingant", "https://api.scrapingant.com/v2/general",
                {"x-api-key": key, "url": url, "browser": "false",
                 "proxy_country": "ae"}, None)
-        # only reached if the cheap attempt found nothing
-        yield ("scrapingant+browser", "https://api.scrapingant.com/v2/general",
-               {"x-api-key": key, "url": url, "browser": "true",
-                "proxy_country": "ae", "block_resource": "image,media,font"},
-               None)
+        # only reached if the cheap attempt found nothing. Kept minimal:
+        # extra parameters are what caused HTTP 422 rejections.
+        if BROWSER_BUDGET[0] > 0:
+            BROWSER_BUDGET[0] -= 1
+            yield ("scrapingant+browser",
+                   "https://api.scrapingant.com/v2/general",
+                   {"x-api-key": key, "url": url, "browser": "true"}, None)
 
     key = os.environ.get("SCRAPFLY_KEY", "").strip()
     if key:
