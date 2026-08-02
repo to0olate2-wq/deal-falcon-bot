@@ -543,7 +543,62 @@ def harvest(obj, out):
             harvest(v, out)
 
 
-PARSE_STATS = {"cards": 0, "named": 0, "one_price": 0, "two_prices": 0}
+PARSE_STATS = {"cards": 0, "named": 0, "priced": 0, "two_prices": 0}
+
+NAME_PATTERNS = [
+    r'<h2[^>]*aria-label="([^"]{5,250})"',
+    r'<h2[^>]*>\s*<a[^>]*>\s*<span[^>]*>([^<]{5,250})</span>',
+    r'<h2[^>]*>.*?<span[^>]*>([^<]{5,250})</span>',
+    r'data-cy="title-recipe"[^>]*>.*?<span[^>]*>([^<]{5,250})</span>',
+    r'<a[^>]*class="[^"]*a-link-normal[^"]*"[^>]*>\s*<span[^>]*>([^<]{8,250})</span>',
+    r'<img[^>]*alt="([^"]{8,250})"',
+]
+
+
+def read_name(chunk):
+    for pat in NAME_PATTERNS:
+        m = re.search(pat, chunk, re.DOTALL)
+        if m:
+            name = html.unescape(m.group(1)).strip()
+            # skip decorative alt text like "Sponsored" or star ratings
+            if len(name) >= 5 and not re.match(
+                    r'^(sponsored|out of \d|\d+(\.\d+)? out of)', name, re.I):
+                return name
+    return None
+
+
+def read_card_prices(chunk):
+    """Amazon writes prices several ways depending on the page version.
+    Try each, cheapest and most reliable first."""
+    # 1. the screen-reader price - one clean number per price
+    prices = [clean_number(x) for x in re.findall(
+        r'<span class="a-offscreen">\s*(?:AED)?\s*([\d,]+\.?\d{0,2})',
+        chunk)]
+    prices = [p for p in prices if p]
+    if len(prices) >= 2:
+        return prices
+
+    # 2. split whole/fraction markup: <a-price-whole>399<a-price-fraction>00
+    split = []
+    for m in re.finditer(
+            r'a-price-whole"[^>]*>\s*([\d,]+)(?:.*?a-price-fraction"[^>]*>'
+            r'\s*(\d{1,2}))?', chunk, re.DOTALL):
+        whole, frac = m.group(1), m.group(2) or "0"
+        n = clean_number(f"{whole}.{frac}")
+        if n:
+            split.append(n)
+    if len(split) >= 2:
+        return split
+    prices = prices or split
+
+    # 3. last resort: an AED amount stated inside price markup
+    loose = [clean_number(x) for x in re.findall(
+        r'a-price[^>]*>[^<]*(?:<[^>]+>[^<]*){0,4}?AED\s*([\d,]+\.?\d{0,2})',
+        chunk)]
+    loose = [p for p in loose if p]
+    if len(loose) >= 2:
+        return loose
+    return prices or loose
 
 
 def parse_amazon_html(html_text):
@@ -552,24 +607,23 @@ def parse_amazon_html(html_text):
     for block in html_text.split('data-asin="')[1:]:
         PARSE_STATS["cards"] += 1
         asin = block[:15].split('"')[0]
-        chunk = block[:7000]
-        m = (re.search(r'<h2[^>]*aria-label="([^"]{5,250})"', chunk)
-             or re.search(r'<h2[^>]*>.*?<span[^>]*>([^<]{5,250})</span>',
-                          chunk, re.DOTALL))
-        if not m:
+        chunk = block[:12000]
+        name = read_name(chunk)
+        if not name:
             continue
         PARSE_STATS["named"] += 1
-        name = html.unescape(m.group(1)).strip()
-        prices = [clean_number(p) for p in re.findall(
-            r'<span class="a-offscreen">\s*(?:AED)?\s*([\d,]+\.?\d*)', chunk)]
-        prices = [p for p in prices if p][:3]
-        if len(prices) == 1:
-            PARSE_STATS["one_price"] += 1
+        prices = read_card_prices(chunk)
+        if prices:
+            PARSE_STATS["priced"] += 1
         if len(prices) < 2:
             continue
         PARSE_STATS["two_prices"] += 1
+        now, was = min(prices[:4]), max(prices[:4])
+        # a "was" price more than 20x the sale price is not a real discount
+        if was > now * 20:
+            continue
         url = f"https://www.amazon.ae/dp/{asin}" if asin else ""
-        add_deal(out, name, min(prices), max(prices), url)
+        add_deal(out, name, now, was, url)
     return out
 
 
@@ -725,9 +779,8 @@ def main():
         ps = PARSE_STATS
         if ps["cards"]:
             status += (f"\n\n\U0001F9EE Parser saw: {ps['cards']} product "
-                       f"cards, {ps['named']} readable, {ps['two_prices']} "
-                       f"with a was-price, {ps['one_price']} at one price "
-                       "only (no discount shown).")
+                       f"cards, {ps['named']} readable, {ps['priced']} "
+                       f"with a price, {ps['two_prices']} with a was-price.")
         found = keys_detected()
         status += ("\n\n\U0001F511 Keys detected: "
                    + (", ".join(found) if found else "none"))
