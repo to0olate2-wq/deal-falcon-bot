@@ -543,10 +543,14 @@ def harvest(obj, out):
             harvest(v, out)
 
 
+PARSE_STATS = {"cards": 0, "named": 0, "one_price": 0, "two_prices": 0}
+
+
 def parse_amazon_html(html_text):
     """Amazon keeps prices in HTML, not JSON, so read the result cards."""
     out = []
     for block in html_text.split('data-asin="')[1:]:
+        PARSE_STATS["cards"] += 1
         asin = block[:15].split('"')[0]
         chunk = block[:7000]
         m = (re.search(r'<h2[^>]*aria-label="([^"]{5,250})"', chunk)
@@ -554,12 +558,16 @@ def parse_amazon_html(html_text):
                           chunk, re.DOTALL))
         if not m:
             continue
+        PARSE_STATS["named"] += 1
         name = html.unescape(m.group(1)).strip()
         prices = [clean_number(p) for p in re.findall(
             r'<span class="a-offscreen">\s*(?:AED)?\s*([\d,]+\.?\d*)', chunk)]
         prices = [p for p in prices if p][:3]
+        if len(prices) == 1:
+            PARSE_STATS["one_price"] += 1
         if len(prices) < 2:
             continue
+        PARSE_STATS["two_prices"] += 1
         url = f"https://www.amazon.ae/dp/{asin}" if asin else ""
         add_deal(out, name, min(prices), max(prices), url)
     return out
@@ -572,6 +580,7 @@ def check_amazon(queries):
     sapi = os.environ.get("SCRAPERAPI_KEY", "").strip()
     for query in queries:
         got = []
+        cards_before = PARSE_STATS["cards"]
         url = "https://www.amazon.ae/s?k=" + urllib.parse.quote_plus(query)
         # 1. ScraperAPI's ready-made Amazon reader (cheapest, cleanest)
         if sapi:
@@ -595,7 +604,12 @@ def check_amazon(queries):
                     SOURCES[name] = SOURCES.get(name, 0) + len(got)
                     break
         if not got:
-            SOURCES["nothing found"] = SOURCES.get("nothing found", 0) + 1
+            if PARSE_STATS["cards"] > cards_before:
+                SOURCES["page ok, no discounts"] = SOURCES.get(
+                    "page ok, no discounts", 0) + 1
+            else:
+                SOURCES["page not usable"] = SOURCES.get(
+                    "page not usable", 0) + 1
         found += got
         time.sleep(1)
     return found
@@ -708,6 +722,12 @@ def main():
             status += "\n\n\U0001F4E1 Data came from:\n" + "\n".join(
                 f"\u2022 {html.escape(k)}: {v}"
                 for k, v in sorted(SOURCES.items(), key=lambda x: -x[1]))
+        ps = PARSE_STATS
+        if ps["cards"]:
+            status += (f"\n\n\U0001F9EE Parser saw: {ps['cards']} product "
+                       f"cards, {ps['named']} readable, {ps['two_prices']} "
+                       f"with a was-price, {ps['one_price']} at one price "
+                       "only (no discount shown).")
         found = keys_detected()
         status += ("\n\n\U0001F511 Keys detected: "
                    + (", ".join(found) if found else "none"))
