@@ -567,38 +567,61 @@ def read_name(chunk):
     return None
 
 
+def _price_from(fragment):
+    """Read one price out of a small piece of Amazon price markup."""
+    m = re.search(r'<span class="a-offscreen">\s*(?:AED)?\s*'
+                  r'([\d,]+\.?\d{0,2})', fragment)
+    if m:
+        return clean_number(m.group(1))
+    m = re.search(r'a-price-whole"[^>]*>\s*([\d,]+)'
+                  r'(?:.*?a-price-fraction"[^>]*>\s*(\d{1,2}))?',
+                  fragment, re.DOTALL)
+    if m:
+        return clean_number(f"{m.group(1)}.{m.group(2) or '0'}")
+    m = re.search(r'AED\s*([\d,]+\.?\d{0,2})', fragment)
+    if m:
+        return clean_number(m.group(1))
+    return None
+
+
 def read_card_prices(chunk):
-    """Amazon writes prices several ways depending on the page version.
-    Try each, cheapest and most reliable first."""
-    # 1. the screen-reader price - one clean number per price
-    prices = [clean_number(x) for x in re.findall(
-        r'<span class="a-offscreen">\s*(?:AED)?\s*([\d,]+\.?\d{0,2})',
-        chunk)]
-    prices = [p for p in prices if p]
-    if len(prices) >= 2:
-        return prices
+    """Return (price_now, price_was).
 
-    # 2. split whole/fraction markup: <a-price-whole>399<a-price-fraction>00
-    split = []
-    for m in re.finditer(
-            r'a-price-whole"[^>]*>\s*([\d,]+)(?:.*?a-price-fraction"[^>]*>'
-            r'\s*(\d{1,2}))?', chunk, re.DOTALL):
-        whole, frac = m.group(1), m.group(2) or "0"
-        n = clean_number(f"{whole}.{frac}")
-        if n:
-            split.append(n)
-    if len(split) >= 2:
-        return split
-    prices = prices or split
+    Amazon shows several prices per product - the price you pay, the
+    crossed-out list price, a per-unit price, other sellers' prices. We tell
+    them apart by their markup instead of guessing from the numbers, because
+    guessing pairs unrelated prices and invents discounts that don't exist.
+    """
+    now = was = None
+    for m in re.finditer(r'class="(a-price[^"]*)"([^>]*)>', chunk):
+        classes, attrs = m.group(1), m.group(2)
+        fragment = chunk[m.end():m.end() + 400]
+        # a per-unit price like "(AED 12.50/liter)" is not the item price.
+        # Compare the visible text, not the markup - a "/" inside a closing
+        # tag is not a unit divider.
+        visible = re.sub(r"<[^>]+>", " ", fragment)
+        if re.match(r'\s*\(?\s*AED\s*[\d.,]+\s*/', visible):
+            continue
+        value = _price_from(fragment)
+        if not value:
+            continue
+        struck = ("a-text-price" in classes or "data-a-strike" in attrs)
+        if struck:
+            if was is None:
+                was = value
+        elif now is None:
+            now = value
+        if now and was:
+            break
 
-    # 3. last resort: an AED amount stated inside price markup
-    loose = [clean_number(x) for x in re.findall(
-        r'a-price[^>]*>[^<]*(?:<[^>]+>[^<]*){0,4}?AED\s*([\d,]+\.?\d{0,2})',
-        chunk)]
-    loose = [p for p in loose if p]
-    if len(loose) >= 2:
-        return loose
-    return prices or loose
+    # some layouts mark the old price only with a strike tag
+    if was is None:
+        m = re.search(r'<(?:s|del)\b[^>]*>(.{0,200}?)</(?:s|del)>',
+                      chunk, re.DOTALL)
+        if m:
+            was = _price_from(m.group(1))
+
+    return now, was
 
 
 def parse_amazon_html(html_text):
@@ -612,13 +635,12 @@ def parse_amazon_html(html_text):
         if not name:
             continue
         PARSE_STATS["named"] += 1
-        prices = read_card_prices(chunk)
-        if prices:
+        now, was = read_card_prices(chunk)
+        if now or was:
             PARSE_STATS["priced"] += 1
-        if len(prices) < 2:
+        if not (now and was):
             continue
         PARSE_STATS["two_prices"] += 1
-        now, was = min(prices[:4]), max(prices[:4])
         # a "was" price more than 20x the sale price is not a real discount
         if was > now * 20:
             continue
