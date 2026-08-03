@@ -543,7 +543,8 @@ def harvest(obj, out):
             harvest(v, out)
 
 
-PARSE_STATS = {"cards": 0, "named": 0, "priced": 0, "two_prices": 0}
+PARSE_STATS = {"cards": 0, "named": 0, "priced": 0, "two_prices": 0,
+               "badged": 0, "corrected": 0}
 
 NAME_PATTERNS = [
     r'<h2[^>]*aria-label="([^"]{5,250})"',
@@ -624,6 +625,29 @@ def read_card_prices(chunk):
     return now, was
 
 
+# Amazon prints its own discount badge, e.g. "-45%". Trusting that is safer
+# than working the percentage out from two prices we might have mispaired.
+# Every pattern needs a minus sign or the word off/save, so product titles
+# like "100% cotton" or "70% cocoa" can never be mistaken for a discount.
+PCT_PATTERNS = [
+    r'>\s*-\s*(\d{1,2})\s*%',
+    r'-\s*(\d{1,2})\s*%\s*<',
+    r'(\d{1,2})\s*%\s*off\b',
+    r'\bsave\s*(\d{1,2})\s*%',
+    r'"savings?_?[Pp]ercentage"\s*:\s*"?(\d{1,2})',
+]
+
+
+def read_badge_percent(chunk):
+    for pat in PCT_PATTERNS:
+        m = re.search(pat, chunk, re.I)
+        if m:
+            v = int(m.group(1))
+            if 1 <= v <= 99:
+                return v
+    return None
+
+
 def parse_amazon_html(html_text):
     """Amazon keeps prices in HTML, not JSON, so read the result cards."""
     out = []
@@ -644,6 +668,15 @@ def parse_amazon_html(html_text):
         # a "was" price more than 20x the sale price is not a real discount
         if was > now * 20:
             continue
+        badge = read_badge_percent(chunk)
+        computed = round((was - now) / was * 100)
+        if badge:
+            PARSE_STATS["badged"] += 1
+            if abs(badge - computed) > 2:
+                # Amazon's own number wins; rebuild the old price to match so
+                # the message agrees with the page
+                PARSE_STATS["corrected"] += 1
+                was = round(now / (1 - badge / 100), 2)
         url = f"https://www.amazon.ae/dp/{asin}" if asin else ""
         add_deal(out, name, now, was, url)
     return out
@@ -802,7 +835,9 @@ def main():
         if ps["cards"]:
             status += (f"\n\n\U0001F9EE Parser saw: {ps['cards']} product "
                        f"cards, {ps['named']} readable, {ps['priced']} "
-                       f"with a price, {ps['two_prices']} with a was-price.")
+                       f"with a price, {ps['two_prices']} with a was-price, "
+                       f"{ps['badged']} showing Amazon's own % badge "
+                       f"({ps['corrected']} corrected to match it).")
         found = keys_detected()
         status += ("\n\n\U0001F511 Keys detected: "
                    + (", ".join(found) if found else "none"))
