@@ -544,7 +544,8 @@ def harvest(obj, out):
 
 
 PARSE_STATS = {"cards": 0, "named": 0, "priced": 0, "two_prices": 0,
-               "badged": 0, "corrected": 0}
+               "badged": 0, "corrected": 0, "unavailable": 0,
+               "from_badge": 0}
 
 NAME_PATTERNS = [
     r'<h2[^>]*aria-label="([^"]{5,250})"',
@@ -566,6 +567,38 @@ def read_name(chunk):
                     r'^(sponsored|out of \d|\d+(\.\d+)? out of)', name, re.I):
                 return name
     return None
+
+
+UNIT_RE = re.compile(
+    r'/\s*(?:\d+(?:\.\d+)?\s*)?'
+    r'(?:g|gm|gr|gram|grams|kg|mg|ml|l|lt|ltr|liter|litre|oz|fl\s*oz|lb|'
+    r'count|ct|piece|pieces|pcs?|item|items|unit|units|sheet|sheets|'
+    r'roll|rolls|wash|washes|load|loads|tablet|capsule|serving|nappy|'
+    r'diaper|wipe|wipes|bag|bags|pod|pods|100\s*g|100\s*ml)\b', re.I)
+
+# words Amazon shows when you cannot actually buy it at that price
+UNAVAILABLE_RE = re.compile(
+    r'currently unavailable|temporarily out of stock|out of stock|'
+    r'sold out|no featured offers|unavailable\b|'
+    r'\u063a\u064a\u0631 \u0645\u062a\u0648\u0641\u0631|'
+    r'\u0646\u0641\u062f\u062a \u0627\u0644\u0643\u0645\u064a\u0629', re.I)
+
+
+def visible_text(fragment):
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", fragment))
+
+
+def is_unit_price(fragment):
+    """True if this price element states a rate per gram, piece, wash, etc."""
+    text = visible_text(fragment)
+    parts = text.split("AED")
+    own = "AED" + parts[1] if len(parts) > 1 else text
+    return bool(UNIT_RE.search(own[:60]))
+
+
+def is_unavailable(chunk):
+    """True if the listing is out of stock, where the shown price is stale."""
+    return bool(UNAVAILABLE_RE.search(visible_text(chunk)))
 
 
 def _price_from(fragment):
@@ -597,16 +630,17 @@ def read_card_prices(chunk):
     for m in re.finditer(r'class="(a-price[^"]*)"([^>]*)>', chunk):
         classes, attrs = m.group(1), m.group(2)
         fragment = chunk[m.end():m.end() + 400]
-        # a per-unit price like "(AED 12.50/liter)" is not the item price.
-        # Compare the visible text, not the markup - a "/" inside a closing
-        # tag is not a unit divider.
-        visible = re.sub(r"<[^>]+>", " ", fragment)
-        if re.match(r'\s*\(?\s*AED\s*[\d.,]+\s*/', visible):
+        # a per-unit price like "(AED 12.50/100 g)" is not the item price
+        if is_unit_price(fragment):
             continue
         value = _price_from(fragment)
         if not value:
             continue
-        struck = ("a-text-price" in classes or "data-a-strike" in attrs)
+        # only a genuinely crossed-out price is the "was" price. Amazon
+        # gives unit prices (AED 12.50/100 g) the same a-text-price class,
+        # but never a strike marker - that is what used to fake discounts
+        # on per-gram and multi-pack listings.
+        struck = ("data-a-strike" in attrs or "a-text-strike" in classes)
         if struck:
             if was is None:
                 was = value
@@ -659,9 +693,17 @@ def parse_amazon_html(html_text):
         if not name:
             continue
         PARSE_STATS["named"] += 1
+        if is_unavailable(chunk):
+            PARSE_STATS["unavailable"] += 1
+            continue
         now, was = read_card_prices(chunk)
         if now or was:
             PARSE_STATS["priced"] += 1
+        if now and not was:
+            b = read_badge_percent(chunk)
+            if b:
+                was = round(now / (1 - b / 100), 2)
+                PARSE_STATS["from_badge"] += 1
         if not (now and was):
             continue
         PARSE_STATS["two_prices"] += 1
@@ -837,7 +879,8 @@ def main():
                        f"cards, {ps['named']} readable, {ps['priced']} "
                        f"with a price, {ps['two_prices']} with a was-price, "
                        f"{ps['badged']} showing Amazon's own % badge "
-                       f"({ps['corrected']} corrected to match it).")
+                       f"({ps['corrected']} corrected to match it). "
+                       f"Skipped {ps['unavailable']} out-of-stock listings.")
         found = keys_detected()
         status += ("\n\n\U0001F511 Keys detected: "
                    + (", ".join(found) if found else "none"))
