@@ -11,6 +11,7 @@ Needs ONE scraping key as a GitHub secret. Any of these works:
   SCRAPERAPI_KEY, SCRAPINGBEE_KEY, ZENROWS_KEY, SCRAPEDO_KEY, SCRAPFLY_KEY
 """
 
+import hashlib
 import html
 import json
 import os
@@ -81,6 +82,9 @@ def load_state():
     raw.setdefault("last_update_id", 0)
     raw.setdefault("paused", False)
     raw.setdefault("known_chats", {})
+    # keys that ran out of credits, stored as hashes - never the real key,
+    # because this file is committed to your repository
+    raw.setdefault("dead_keys", {})
     return raw
 
 
@@ -178,9 +182,24 @@ HELP_TEXT = (
     "<b>/resume</b> - start hunting again\n"
     "<b>/post -100123...</b> - post deals to a channel instead\n"
     "<b>/private</b> - bring deals back to this chat\n"
+    "<b>/filter on</b> / <b>off</b> - ask Amazon for discounted items only\n"
     "<b>/forget</b> - clear the memory of deals already sent\n"
     "<b>/help</b> - this list"
 )
+
+
+def last_run_line():
+    lr = STATE.get("last_run")
+    if not lr:
+        return ""
+    ago = max(0, int((time.time() - lr["time"]) // 60))
+    when = f"{ago} min ago" if ago < 120 else f"{ago // 60} h ago"
+    line = (f"Last sweep: <b>{when}</b> \u00b7 {lr['deals']} discounted, "
+            f"{lr['new']} new \u00b7 ~{lr['credits']} credits\n")
+    fc = credit_forecast(lr["credits"])
+    if fc:
+        line += re.sub(r"^\U0001F4CA ", "", fc) + "\n"
+    return line
 
 
 def status_text():
@@ -195,7 +214,9 @@ def status_text():
         f"Categories per sweep: <b>{per_shown}</b> (of {total})\n"
         f"Hunting: <b>{'paused' if STATE['paused'] else 'active'}</b>\n"
         f"Deals remembered: <b>{len(STATE['seen'])}</b>\n"
-        f"Deals posted to: <b>"
+        f"Discount filter: <b>{'on' if filter_on() else 'off'}</b>\n"
+        + last_run_line()
+        + f"Deals posted to: <b>"
         + (html.escape(str(post_target())) if posting_elsewhere()
            else "this chat") + "</b>"
     )
@@ -288,6 +309,13 @@ def apply_command(text):
         STATE["settings"]["post_to"] = ""
         return "\u2705 Deals will come to this chat only."
 
+    if cmd == "/filter":
+        if arg not in ("on", "off"):
+            return ("Send <code>/filter on</code> or <code>/filter off</code>."
+                    "\nOn asks Amazon for discounted items only.")
+        STATE["settings"]["use_discount_filter"] = (arg == "on")
+        return f"\u2705 Discount filter turned <b>{arg}</b>."
+
     if cmd == "/pause":
         STATE["paused"] = True
         return "\u23F8 Hunting paused. Send /resume to start again."
@@ -363,52 +391,6 @@ def read_commands():
 
 # ---------------------------------------------------- scraping providers
 
-def provider_specs(url):
-    """Only services whose key is set as a GitHub secret are used, so you
-    can switch provider by adding a different secret - no code changes."""
-    key = os.environ.get("SCRAPERAPI_KEY", "").strip()
-    if key:
-        yield ("scraperapi", "https://api.scraperapi.com/",
-               {"api_key": key, "url": url, "country_code": "ae"}, None)
-
-    key = os.environ.get("SCRAPINGBEE_KEY", "").strip()
-    if key:
-        yield ("scrapingbee", "https://app.scrapingbee.com/api/v1/",
-               {"api_key": key, "url": url, "country_code": "ae",
-                "render_js": "false"}, None)
-
-    key = os.environ.get("ZENROWS_KEY", "").strip()
-    if key:
-        yield ("zenrows", "https://api.zenrows.com/v1/",
-               {"apikey": key, "url": url, "proxy_country": "ae"}, None)
-
-    key = os.environ.get("SCRAPEDO_KEY", "").strip()
-    if key:
-        yield ("scrape.do", "https://api.scrape.do/",
-               {"token": key, "url": url, "geoCode": "ae"}, None)
-
-    key = os.environ.get("SCRAPINGANT_KEY", "").strip()
-    if key:
-        # cheap first: no browser rendering costs 1 credit instead of 10,
-        # and Amazon search pages carry prices in plain HTML anyway
-        yield ("scrapingant", "https://api.scrapingant.com/v2/general",
-               {"x-api-key": key, "url": url, "browser": "false",
-                "proxy_country": "ae"}, None)
-        # only reached if the cheap attempt found nothing. Kept minimal:
-        # extra parameters are what caused HTTP 422 rejections.
-        if BROWSER_BUDGET[0] > 0:
-            BROWSER_BUDGET[0] -= 1
-            yield ("scrapingant+browser",
-                   "https://api.scrapingant.com/v2/general",
-                   {"x-api-key": key, "url": url, "browser": "true"}, None)
-
-    key = os.environ.get("SCRAPFLY_KEY", "").strip()
-    if key:
-        yield ("scrapfly", "https://api.scrapfly.io/scrape",
-               {"key": key, "url": url, "country": "ae", "asp": "true"},
-               "scrapfly")
-
-
 KEY_NAMES = {
     "SCRAPERAPI_KEY": "scraperapi",
     "SCRAPINGBEE_KEY": "scrapingbee",
@@ -418,29 +400,213 @@ KEY_NAMES = {
     "SCRAPFLY_KEY": "scrapfly",
 }
 
+# a key that runs out of credits is rested this long before being tried again
+REST_HOURS = 24
+# status codes that mean "this key can't be used right now" - move to the next
+KEY_DEAD_CODES = (401, 402, 403)      # wrong key, or out of credits
+KEY_BUSY_CODES = (409, 429)           # too many requests at once
+
+_rotation = {}
+KEY_USE = {}          # (provider, key number) -> credits spent this run
+KEY_STATUS = {}       # (provider, key number) -> "ok" / "out of credits"
+
+
+def key_list(env_name):
+    """One secret can hold several keys, separated by commas or spaces."""
+    raw = os.environ.get(env_name, "")
+    return [k.strip() for k in re.split(r"[,;\s]+", raw) if k.strip()]
+
+
+def key_id(key):
+    return hashlib.sha256(key.encode()).hexdigest()[:12]
+
+
+def key_is_resting(key):
+    since = STATE["dead_keys"].get(key_id(key))
+    return bool(since) and time.time() - since < REST_HOURS * 3600
+
+
+def keys_in_turn(env_name):
+    """Usable keys for a provider, rotated so every account shares the load.
+    Returns (key number, key) pairs - the number is only for reports, so no
+    part of a real key ever appears in logs."""
+    keys = list(enumerate(key_list(env_name), start=1))
+    ready = [(i, k) for i, k in keys if not key_is_resting(k)]
+    for i, k in keys:
+        if key_is_resting(k):
+            KEY_STATUS[(KEY_NAMES[env_name], i)] = "out of credits"
+    if not ready:
+        return []
+    start = _rotation.get(env_name, 0) % len(ready)
+    _rotation[env_name] = start + 1
+    return ready[start:] + ready[:start]
+
+
+def provider_specs(url):
+    """Every service the bot understands, as (name, endpoint, params-maker,
+    wrapper, secret name, credit cost). Only services with a key are used."""
+    yield ("scraperapi", "https://api.scraperapi.com/",
+           lambda k: {"api_key": k, "url": url, "country_code": "ae"},
+           None, "SCRAPERAPI_KEY", 1)
+    yield ("scrapingbee", "https://app.scrapingbee.com/api/v1/",
+           lambda k: {"api_key": k, "url": url, "country_code": "ae",
+                      "render_js": "false"},
+           None, "SCRAPINGBEE_KEY", 1)
+    yield ("zenrows", "https://api.zenrows.com/v1/",
+           lambda k: {"apikey": k, "url": url, "proxy_country": "ae"},
+           None, "ZENROWS_KEY", 1)
+    yield ("scrape.do", "https://api.scrape.do/",
+           lambda k: {"token": k, "url": url, "geoCode": "ae"},
+           None, "SCRAPEDO_KEY", 1)
+    # cheap first: no browser rendering costs 1 credit instead of 10,
+    # and Amazon search pages carry prices in plain HTML anyway
+    yield ("scrapingant", "https://api.scrapingant.com/v2/general",
+           lambda k: {"x-api-key": k, "url": url, "browser": "false",
+                      "proxy_country": "ae"},
+           None, "SCRAPINGANT_KEY", 1)
+    # only reached if the cheap attempt found nothing, and capped per run
+    if key_list("SCRAPINGANT_KEY") and BROWSER_BUDGET[0] > 0:
+        BROWSER_BUDGET[0] -= 1
+        yield ("scrapingant+browser", "https://api.scrapingant.com/v2/general",
+               lambda k: {"x-api-key": k, "url": url, "browser": "true"},
+               None, "SCRAPINGANT_KEY", 10)
+    yield ("scrapfly", "https://api.scrapfly.io/scrape",
+           lambda k: {"key": k, "url": url, "country": "ae", "asp": "true"},
+           "scrapfly", "SCRAPFLY_KEY", 1)
+
 
 def keys_detected():
-    return [v for k, v in KEY_NAMES.items() if os.environ.get(k, "").strip()]
+    return [v for k, v in KEY_NAMES.items() if key_list(k)]
 
 
 def any_key_set():
     return bool(keys_detected())
 
 
-def call_providers(url):
-    for name, endpoint, params, wrapper in provider_specs(url):
+def fetch_with_keys(env_name, name, endpoint, make_params, cost, timeout=180):
+    """Try this provider's keys in turn. A key that is out of credits is set
+    aside and the SAME request moves straight to the next key, so an empty
+    account never costs you a category. Returns the response, or None."""
+    provider = KEY_NAMES[env_name]
+    for num, key in keys_in_turn(env_name):
         try:
-            r = requests.get(endpoint, params=params, timeout=180)
-            if r.status_code != 200:
-                TRACE.append(f"{name}: HTTP {r.status_code}")
-                continue
+            r = requests.get(endpoint, params=make_params(key), timeout=timeout)
+        except Exception as e:
+            TRACE.append(f"{name}: {type(e).__name__}")
+            return None                       # network trouble, not the key
+        if r.status_code in KEY_DEAD_CODES:
+            STATE["dead_keys"][key_id(key)] = time.time()
+            KEY_STATUS[(provider, num)] = "out of credits"
+            TRACE.append(f"{provider} key {num}: HTTP {r.status_code} - "
+                         "out of credits or invalid, switching key")
+            continue
+        if r.status_code in KEY_BUSY_CODES:
+            TRACE.append(f"{provider} key {num}: busy, switching key")
+            continue
+        KEY_STATUS.setdefault((provider, num), "ok")
+        if r.status_code == 200:
+            KEY_USE[(provider, num)] = KEY_USE.get((provider, num), 0) + cost
+            # a key that works again after its reset is no longer resting
+            STATE["dead_keys"].pop(key_id(key), None)
+            KEY_STATUS[(provider, num)] = "ok"
+        return r                              # a site-side answer: no other
+    return None                               # key would do better
+
+
+def schedule_runs_per_day():
+    """Read the hunt schedule from the workflow file, so the forecast always
+    matches what GitHub will actually run."""
+    try:
+        wf = (ROOT / ".github" / "workflows" / "dealbot.yml").read_text()
+    except Exception:
+        return None
+    hours = set()
+    for expr in re.findall(r'cron:\s*["\']([^"\']+)["\']', wf):
+        fields = expr.split()
+        if len(fields) < 2:
+            continue
+        for part in fields[1].split(","):
+            step = 1
+            if "/" in part:
+                part, step_s = part.split("/", 1)
+                step = max(1, int(step_s))
+            if part == "*":
+                lo, hi = 0, 23
+            elif "-" in part:
+                lo, hi = (int(x) for x in part.split("-", 1))
+            else:
+                lo = hi = int(part)
+                if step > 1:
+                    hi = 23
+            hours.update(range(lo, hi + 1, step))
+    return len(hours) or None
+
+
+def credit_forecast(credits_this_run):
+    runs = schedule_runs_per_day()
+    keys = sum(len(key_list(k)) for k in KEY_NAMES)
+    per_key = int(CONFIG.get("credits_per_key_per_month", 10000))
+    if not runs or not credits_this_run:
+        return ""
+    monthly = credits_this_run * runs * 30
+    allowance = keys * per_key
+    needed = -(-monthly // per_key)
+    line = (f"\U0001F4CA Credits: ~{credits_this_run} this run \u00d7 {runs} "
+            f"runs/day \u2248 {monthly:,}/month. Your {keys} key"
+            f"{'s' if keys != 1 else ''} allow ~{allowance:,}.")
+    if monthly <= allowance:
+        line += " \u2705"
+    else:
+        line += (f"\n\u26A0\uFE0F Not enough: you need about {needed} keys "
+                 "at this schedule, or send /categories to scan fewer per run.")
+    return line
+
+
+def key_report():
+    """Per-account health for the status message. Uses key numbers only."""
+    lines = []
+    for env_name, provider in KEY_NAMES.items():
+        keys = key_list(env_name)
+        if not keys:
+            continue
+        spent = sum(v for (pv, _), v in KEY_USE.items() if pv == provider)
+        lines.append(f"\U0001F511 {provider}: {len(keys)} key"
+                     f"{'s' if len(keys) > 1 else ''} \u00b7 ~{spent} credits "
+                     "this run")
+        for num in range(1, len(keys) + 1):
+            status = KEY_STATUS.get((provider, num))
+            if status is None:
+                status = ("out of credits" if key_is_resting(keys[num - 1])
+                          else "not needed this run")
+            used = KEY_USE.get((provider, num), 0)
+            icon = "\u274C" if status == "out of credits" else "\u2705"
+            lines.append(f"   {icon} key {num}: {status}"
+                         + (f" \u00b7 ~{used} credits" if used else ""))
+        if keys and all(key_is_resting(k) for k in keys):
+            lines.append("   \u26A0\uFE0F Every key is out of credits - "
+                         "no pages can be fetched until one resets.")
+    return "\n".join(lines) if lines else "\U0001F511 Keys detected: none"
+
+
+def call_providers(url):
+    for name, endpoint, make, wrapper, env_name, cost in provider_specs(url):
+        if not key_list(env_name):
+            continue
+        r = fetch_with_keys(env_name, name, endpoint, make, cost)
+        if r is None:
+            continue
+        if r.status_code != 200:
+            TRACE.append(f"{name}: HTTP {r.status_code}")
+            continue
+        try:
             text = r.text
             if wrapper == "scrapfly":
                 text = r.json().get("result", {}).get("content", "")
-            if len(text) > 3000:
-                yield name, text
         except Exception as e:
             TRACE.append(f"{name}: {type(e).__name__}")
+            continue
+        if len(text) > 3000:
+            yield name, text
 
 
 # ---------------------------------------------------------------- parsing
@@ -726,41 +892,117 @@ def parse_amazon_html(html_text):
 
 # ---------------------------------------------------------------- hunting
 
+# ---- smarter scanning ------------------------------------------------------
+# Amazon has an unofficial search filter, &pct-off=30-85, that returns only
+# discounted items. Where it's honoured, every slot on the page is a deal
+# instead of a handful. Where it's ignored, results are the same as without
+# it - so it can only help. The run report measures which is happening.
+RICH_PAGE = 10          # a page with this many deals probably has more on the next
+EXTRA_PAGES = [int(CONFIG.get("extra_pages_per_run", 20))]
+MAX_PAGES = int(CONFIG.get("max_pages_per_search", 3))
+FILTER_STATS = {"pages": 0, "cards": 0, "discounted": 0, "no_results": 0}
+SCAN_STATS = {"extra_pages": 0}
+
+NO_RESULTS_RE = re.compile(
+    r"No results for|did not match any products|"
+    r"\u0644\u0627 \u062a\u0648\u062c\u062f \u0646\u062a\u0627\u0626\u062c", re.I)
+
+
+def filter_on():
+    v = STATE["settings"].get("use_discount_filter")
+    if v is None:
+        v = CONFIG.get("use_discount_filter", True)
+    return bool(v)
+
+
+def search_url(query, page=1, filtered=True):
+    url = "https://www.amazon.ae/s?k=" + urllib.parse.quote_plus(query)
+    if filtered:
+        lo = int(setting("min_discount_percent"))
+        hi = int(setting("max_discount_percent"))
+        url += f"&pct-off={lo}-{hi}"
+    if page > 1:
+        url += f"&page={page}"
+    return url
+
+
+def fetch_page(url):
+    """Fetch one results page. Returns (deals, cards, source, no_results).
+
+    Stops at the first provider that returns a REAL results page - even one
+    with no discounts. Escalating a perfectly good page to the 10-credit
+    browser mode was pure waste; escalation is now only for broken pages."""
+    before = PARSE_STATS["cards"]
+    for name, html_text in call_providers(url):
+        deals = parse_amazon_html(html_text)
+        cards = PARSE_STATS["cards"] - before
+        no_results = bool(NO_RESULTS_RE.search(html_text[:300000]))
+        if cards or no_results:
+            return deals, cards, name, no_results
+    return [], PARSE_STATS["cards"] - before, None, False
+
+
+def scan_search(query):
+    """One keyword, going deeper only while pages stay rich in deals."""
+    filtered = filter_on()
+    deals, any_cards, any_empty = [], False, False
+    page = 1
+    while True:
+        page_deals, cards, src, no_results = fetch_page(
+            search_url(query, page, filtered))
+        if filtered:
+            FILTER_STATS["pages"] += 1
+            FILTER_STATS["cards"] += cards
+            FILTER_STATS["discounted"] += len(page_deals)
+            FILTER_STATS["no_results"] += int(no_results)
+        if src and page_deals:
+            SOURCES[src] = SOURCES.get(src, 0) + len(page_deals)
+        deals += page_deals
+        any_cards = any_cards or cards > 0
+        any_empty = any_empty or no_results
+        if (len(page_deals) >= RICH_PAGE and page < MAX_PAGES
+                and EXTRA_PAGES[0] > 0):
+            EXTRA_PAGES[0] -= 1
+            SCAN_STATS["extra_pages"] += 1
+            page += 1
+            time.sleep(1)
+            continue
+        return deals, any_cards, any_empty
+
+
 def check_amazon(queries):
     found = []
-    sapi = os.environ.get("SCRAPERAPI_KEY", "").strip()
+    sapi = key_list("SCRAPERAPI_KEY")
     for query in queries:
         got = []
-        cards_before = PARSE_STATS["cards"]
-        url = "https://www.amazon.ae/s?k=" + urllib.parse.quote_plus(query)
-        # 1. ScraperAPI's ready-made Amazon reader (cheapest, cleanest)
+        any_cards = any_empty = False
+        # 1. ScraperAPI's ready-made Amazon reader (only if you use ScraperAPI)
         if sapi:
-            try:
-                r = requests.get(
-                    "https://api.scraperapi.com/structured/amazon/search",
-                    params={"api_key": sapi, "query": query,
-                            "tld": "ae", "country": "ae"}, timeout=120)
-                if r.status_code == 200:
+            r = fetch_with_keys(
+                "SCRAPERAPI_KEY", "scraperapi structured",
+                "https://api.scraperapi.com/structured/amazon/search",
+                lambda k, q=query: {"api_key": k, "query": q,
+                                    "tld": "ae", "country": "ae"},
+                1, timeout=120)
+            if r is not None and r.status_code == 200:
+                try:
                     harvest(r.json(), got)
-                    if got:
-                        SOURCES["scraperapi structured"] = SOURCES.get(
-                            "scraperapi structured", 0) + len(got)
-            except Exception as e:
-                TRACE.append(f"structured: {type(e).__name__}")
-        # 2. any other provider, reading the normal search page
-        if not got:
-            for name, page in call_providers(url):
-                got = parse_amazon_html(page)
+                except Exception as e:
+                    TRACE.append(f"structured: {type(e).__name__}")
                 if got:
-                    SOURCES[name] = SOURCES.get(name, 0) + len(got)
-                    break
+                    SOURCES["scraperapi structured"] = SOURCES.get(
+                        "scraperapi structured", 0) + len(got)
+        # 2. the search results pages themselves
         if not got:
-            if PARSE_STATS["cards"] > cards_before:
-                SOURCES["page ok, no discounts"] = SOURCES.get(
-                    "page ok, no discounts", 0) + 1
+            got, any_cards, any_empty = scan_search(query)
+        if not got:
+            if any_cards:
+                label = "page ok, no discounts"
+            elif any_empty:
+                label = "no items at this discount"
             else:
-                SOURCES["page not usable"] = SOURCES.get(
-                    "page not usable", 0) + 1
+                label = "page not usable"
+            SOURCES[label] = SOURCES.get(label, 0) + 1
         found += got
         time.sleep(1)
     return found
@@ -859,6 +1101,8 @@ def main():
             send_telegram(chunk)
 
     STATE["cursor"] = next_cursor
+    STATE["last_run"] = {"time": int(now_ts), "credits": sum(KEY_USE.values()),
+                         "deals": len(deals), "new": len(fresh)}
     for k in [k for k, ts in STATE["seen"].items()
               if now_ts - ts > REMEMBER_DAYS * 86400]:
         del STATE["seen"][k]
@@ -881,9 +1125,25 @@ def main():
                        f"{ps['badged']} showing Amazon's own % badge "
                        f"({ps['corrected']} corrected to match it). "
                        f"Skipped {ps['unavailable']} out-of-stock listings.")
-        found = keys_detected()
-        status += ("\n\n\U0001F511 Keys detected: "
-                   + (", ".join(found) if found else "none"))
+        if FILTER_STATS["pages"]:
+            fs = FILTER_STATS
+            share = (100 * fs["discounted"] // fs["cards"]) if fs["cards"] else 0
+            verdict = ("working \u2705" if share >= 40 else
+                       "probably ignored by Amazon.ae - harmless, same "
+                       "results as without it" if fs["cards"] else
+                       "no data yet")
+            status += (f"\n\n\U0001F3AF Discount filter: {verdict}\n"
+                       f"   {fs['discounted']} of {fs['cards']} products on "
+                       f"filtered pages were deals ({share}%). "
+                       f"{fs['no_results']} searches had nothing at this "
+                       "discount.")
+        if SCAN_STATS["extra_pages"]:
+            status += (f"\n\U0001F4C4 Went deeper on rich searches: "
+                       f"{SCAN_STATS['extra_pages']} extra pages.")
+        status += "\n\n" + key_report()
+        fc = credit_forecast(sum(KEY_USE.values()))
+        if fc:
+            status += "\n" + fc
         if TRACE:
             counts = {}
             for t in TRACE:
