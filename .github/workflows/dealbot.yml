@@ -2,11 +2,19 @@ name: Deal Falcon
 
 on:
   schedule:
-    - cron: "0 5,15 * * *"
+    # Every 6 hours (4 sweeps a day), at 17 minutes past the hour because
+    # GitHub delays jobs that start exactly on the hour.
+    # UAE times: 4:17, 10:17, 16:17, 22:17
+    - cron: "17 */6 * * *"
   workflow_dispatch: {}
 
 permissions:
   contents: write
+
+# never let two sweeps run at once
+concurrency:
+  group: deal-falcon-hunt
+  cancel-in-progress: false
 
 jobs:
   hunt:
